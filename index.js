@@ -37,7 +37,7 @@ async function askGemini(prompt, context) {
     ? `Berikut adalah riwayat percakapan grup WhatsApp:\n\n${context}\n\n---\n\n${prompt}`
     : prompt;
   const response = await ai.models.generateContent({
-    model: "gemini-2.0-flash",
+    model: "gemini-3.8-flash",
     contents: fullPrompt,
   });
   return response.text;
