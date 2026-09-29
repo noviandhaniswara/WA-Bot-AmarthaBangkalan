@@ -1,15 +1,14 @@
 import express from "express";
 import qrcode from "qrcode";
 import pino from "pino";
-import Anthropic from "@anthropic-ai/sdk";
+import { GoogleGenerativeAI } from "@google/generative-ai";
 import { makeWASocket, useMultiFileAuthState, DisconnectReason } from "@whiskeysockets/baileys";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const anthropic = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY,
-});
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
 
 let latestQR = null;
 let connectionStatus = "menghubungkan...";
@@ -31,23 +30,15 @@ function formatHistory(groupId) {
   return history.map((h) => `${h.sender}: ${h.text}`).join("\n");
 }
 
-async function askClaude(prompt, context) {
-  const message = await anthropic.messages.create({
-    model: "claude-sonnet-4-5",
-    max_tokens: 1024,
-    messages: [
-      {
-        role: "user",
-        content: context
-          ? `Berikut adalah riwayat percakapan grup WhatsApp:\n\n${context}\n\n---\n\n${prompt}`
-          : prompt,
-      },
-    ],
-  });
-  return message.content[0].text;
+async function askGemini(prompt, context) {
+  const fullPrompt = context
+    ? `Berikut adalah riwayat percakapan grup WhatsApp:\n\n${context}\n\n---\n\n${prompt}`
+    : prompt;
+  const result = await model.generateContent(fullPrompt);
+  return result.response.text();
 }
 
-// Bersihkan teks dari tag @62812xxxx supaya nggak ikut dikirim ke Claude
+// Bersihkan teks dari tag @62812xxxx supaya nggak ikut dikirim ke Gemini
 function stripMentions(text) {
   return text.replace(/@\d+/g, "").trim();
 }
@@ -73,7 +64,7 @@ async function startBot() {
     if (connection === "open") {
       connectionStatus = "terhubung";
       latestQR = null;
-      botJid = sock.user.id.split(":")[0]; // nomor bot tanpa suffix device
+      botJid = sock.user.id.split(":")[0];
       console.log("Bot berhasil terhubung ke WhatsApp! JID:", botJid);
     }
 
@@ -101,12 +92,10 @@ async function startBot() {
 
     if (!text) return;
 
-    // Simpan ke riwayat kalau ini pesan grup
     if (isGroup) {
       addToHistory(from, sender, text);
     }
 
-    // Cek apakah bot di-mention/tag di pesan ini
     const mentionedJids =
       msg.message.extendedTextMessage?.contextInfo?.mentionedJid || [];
     const isMentioned = botJid && mentionedJids.some((jid) => jid.startsWith(botJid));
@@ -121,7 +110,7 @@ async function startBot() {
           await sock.sendMessage(from, { text: "Belum ada riwayat percakapan yang bisa dirangkum." });
           return;
         }
-        const result = await askClaude(
+        const result = await askGemini(
           "Buat rangkuman singkat dan jelas dari diskusi di atas. Fokus pada poin-poin penting saja.",
           context
         );
@@ -133,7 +122,7 @@ async function startBot() {
           await sock.sendMessage(from, { text: "Belum ada riwayat percakapan yang bisa dianalisis." });
           return;
         }
-        const result = await askClaude(
+        const result = await askGemini(
           "Analisis diskusi di atas: apa masalah utamanya, apa saja risikonya, dan berikan saran action plan yang konkret dan bisa langsung dijalankan.",
           context
         );
@@ -145,7 +134,7 @@ async function startBot() {
           await sock.sendMessage(from, { text: "Belum ada riwayat percakapan yang bisa dihitung." });
           return;
         }
-        const result = await askClaude(
+        const result = await askGemini(
           "Berdasarkan angka-angka atau data yang disebutkan dalam diskusi di atas, buat proyeksi/perkiraan ke depan yang masuk akal. Jika datanya tidak cukup untuk proyeksi yang akurat, katakan dengan jelas data apa yang masih kurang.",
           context
         );
@@ -161,18 +150,16 @@ async function startBot() {
             "Atau tag/mention saya langsung diikuti pertanyaan apa saja, saya akan jawab seperti chat biasa.",
         });
       } else if (isGroup && isMentioned) {
-        // Mode ngobrol bebas di grup: bot di-mention + ada pertanyaan
         const question = stripMentions(text);
         if (!question) {
           await sock.sendMessage(from, { text: "Ya, ada yang bisa saya bantu? Tulis pertanyaannya setelah tag saya." });
           return;
         }
         const context = formatHistory(from);
-        const result = await askClaude(question, context);
+        const result = await askGemini(question, context);
         await sock.sendMessage(from, { text: result });
       } else if (!isGroup) {
-        // Chat pribadi: selalu mode ngobrol bebas
-        const result = await askClaude(text, "");
+        const result = await askGemini(text, "");
         await sock.sendMessage(from, { text: result });
       }
     } catch (err) {

@@ -7,7 +7,7 @@
   },
   "dependencies": {
     "@whiskeysockets/baileys": "^6.7.9",
-    "@anthropic-ai/sdk": "^0.32.1",
+    "@google/generative-ai": "^0.21.0",
     "express": "^4.19.2",
     "qrcode": "^1.5.4",
     "pino": "^9.4.0"
