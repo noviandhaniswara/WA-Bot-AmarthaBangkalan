@@ -7,7 +7,10 @@ import { makeWASocket, useMultiFileAuthState, DisconnectReason } from "@whiskeys
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+const ai = new GoogleGenAI({
+  vertexai: false,
+  apiKey: process.env.GEMINI_API_KEY,
+});
 
 let latestQR = null;
 let connectionStatus = "menghubungkan...";
