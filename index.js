@@ -2,7 +2,7 @@ import express from "express";
 import qrcode from "qrcode";
 import pino from "pino";
 import { GoogleGenAI } from "@google/genai";
-import { makeWASocket, useMultiFileAuthState, DisconnectReason } from "@whiskeysockets/baileys";
+import { makeWASocket, useMultiFileAuthState, DisconnectReason, downloadMediaMessage } from "@whiskeysockets/baileys";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -60,6 +60,37 @@ async function askGemini(prompt, context, retries = 3) {
   }
 }
 
+async function askGeminiWithImage(prompt, imageBase64, mimeType, retries = 3) {
+  for (let attempt = 0; attempt < retries; attempt++) {
+    try {
+      const response = await ai.models.generateContent({
+        model: "gemini-3.5-flash",
+        contents: [
+          {
+            role: "user",
+            parts: [
+              { text: prompt || "Jelaskan dan analisis isi gambar ini." },
+              { inlineData: { mimeType, data: imageBase64 } },
+            ],
+          },
+        ],
+      });
+      return response.text;
+    } catch (err) {
+      const isRetryable =
+        err?.status === 503 || err?.message?.includes("UNAVAILABLE") || err?.message?.includes("high demand");
+      const isLastAttempt = attempt === retries - 1;
+
+      if (!isRetryable || isLastAttempt) {
+        throw err;
+      }
+
+      const waitMs = 2000 * (attempt + 1);
+      await new Promise((resolve) => setTimeout(resolve, waitMs));
+    }
+  }
+}
+
 // Bersihkan teks dari tag @62812xxxx supaya nggak ikut dikirim ke Gemini
 function stripMentions(text) {
   return text.replace(/@\d+/g, "").trim();
@@ -107,6 +138,25 @@ async function startBot() {
     const isGroup = from.endsWith("@g.us");
     const sender = msg.pushName || msg.key.participant || from;
 
+    // Cek kalau pesan ini gambar (dengan atau tanpa caption)
+    const imageMessage = msg.message.imageMessage;
+    if (imageMessage) {
+      try {
+        const buffer = await downloadMediaMessage(msg, "buffer", {});
+        const imageBase64 = buffer.toString("base64");
+        const mimeType = imageMessage.mimetype || "image/jpeg";
+        const caption = imageMessage.caption || "";
+
+        await sock.sendMessage(from, { text: "Sedang menganalisis gambar, tunggu sebentar..." });
+        const result = await askGeminiWithImage(caption, imageBase64, mimeType);
+        await sock.sendMessage(from, { text: result });
+      } catch (err) {
+        console.error("Error saat proses gambar:", err);
+        await sock.sendMessage(from, { text: "Maaf, gagal menganalisis gambar ini. Coba lagi." });
+      }
+      return;
+    }
+
     const text =
       msg.message.conversation ||
       msg.message.extendedTextMessage?.text ||
@@ -120,7 +170,12 @@ async function startBot() {
 
     const mentionedJids =
       msg.message.extendedTextMessage?.contextInfo?.mentionedJid || [];
-    const isMentioned = botJid && mentionedJids.some((jid) => jid.startsWith(botJid));
+    const isMentioned =
+      botJid && mentionedJids.some((jid) => jid.split("@")[0] === botJid);
+
+    if (isGroup && mentionedJids.length > 0) {
+      console.log("Debug mention -> botJid:", botJid, "| mentionedJids:", mentionedJids, "| isMentioned:", isMentioned);
+    }
 
     const command = text.trim().toLowerCase();
 
