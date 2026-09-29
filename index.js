@@ -13,6 +13,7 @@ const anthropic = new Anthropic({
 
 let latestQR = null;
 let connectionStatus = "menghubungkan...";
+let botJid = null; // nomor bot sendiri, diisi setelah connect
 
 // Menyimpan riwayat pesan per grup, maksimal 200 pesan terakhir
 const groupHistory = new Map();
@@ -37,11 +38,18 @@ async function askClaude(prompt, context) {
     messages: [
       {
         role: "user",
-        content: `Berikut adalah riwayat percakapan grup WhatsApp:\n\n${context}\n\n---\n\n${prompt}`,
+        content: context
+          ? `Berikut adalah riwayat percakapan grup WhatsApp:\n\n${context}\n\n---\n\n${prompt}`
+          : prompt,
       },
     ],
   });
   return message.content[0].text;
+}
+
+// Bersihkan teks dari tag @62812xxxx supaya nggak ikut dikirim ke Claude
+function stripMentions(text) {
+  return text.replace(/@\d+/g, "").trim();
 }
 
 async function startBot() {
@@ -65,7 +73,8 @@ async function startBot() {
     if (connection === "open") {
       connectionStatus = "terhubung";
       latestQR = null;
-      console.log("Bot berhasil terhubung ke WhatsApp!");
+      botJid = sock.user.id.split(":")[0]; // nomor bot tanpa suffix device
+      console.log("Bot berhasil terhubung ke WhatsApp! JID:", botJid);
     }
 
     if (connection === "close") {
@@ -96,6 +105,11 @@ async function startBot() {
     if (isGroup) {
       addToHistory(from, sender, text);
     }
+
+    // Cek apakah bot di-mention/tag di pesan ini
+    const mentionedJids =
+      msg.message.extendedTextMessage?.contextInfo?.mentionedJid || [];
+    const isMentioned = botJid && mentionedJids.some((jid) => jid.startsWith(botJid));
 
     const command = text.trim().toLowerCase();
 
@@ -143,10 +157,23 @@ async function startBot() {
             "/rangkum - merangkum diskusi grup\n" +
             "/analisa - analisis masalah + saran action plan\n" +
             "/proyeksi - hitung proyeksi dari data di chat\n" +
-            "/help - tampilkan menu ini",
+            "/help - tampilkan menu ini\n\n" +
+            "Atau tag/mention saya langsung diikuti pertanyaan apa saja, saya akan jawab seperti chat biasa.",
         });
+      } else if (isGroup && isMentioned) {
+        // Mode ngobrol bebas di grup: bot di-mention + ada pertanyaan
+        const question = stripMentions(text);
+        if (!question) {
+          await sock.sendMessage(from, { text: "Ya, ada yang bisa saya bantu? Tulis pertanyaannya setelah tag saya." });
+          return;
+        }
+        const context = formatHistory(from);
+        const result = await askClaude(question, context);
+        await sock.sendMessage(from, { text: result });
       } else if (!isGroup) {
-        await sock.sendMessage(from, { text: "halo, ketik /help untuk lihat perintah yang tersedia" });
+        // Chat pribadi: selalu mode ngobrol bebas
+        const result = await askClaude(text, "");
+        await sock.sendMessage(from, { text: result });
       }
     } catch (err) {
       console.error("Error saat proses pesan:", err);
