@@ -40,7 +40,7 @@ async function askGemini(prompt, context, retries = 3) {
   for (let attempt = 0; attempt < retries; attempt++) {
     try {
       const response = await ai.models.generateContent({
-        model: "gemini-3.8-flash",
+        model: "gemini-3.5-flash",
         contents: fullPrompt,
       });
       return response.text;
