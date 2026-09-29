@@ -1,14 +1,13 @@
 import express from "express";
 import qrcode from "qrcode";
 import pino from "pino";
-import { GoogleGenerativeAI } from "@google/generative-ai";
+import { GoogleGenAI } from "@google/genai";
 import { makeWASocket, useMultiFileAuthState, DisconnectReason } from "@whiskeysockets/baileys";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
 let latestQR = null;
 let connectionStatus = "menghubungkan...";
@@ -34,8 +33,11 @@ async function askGemini(prompt, context) {
   const fullPrompt = context
     ? `Berikut adalah riwayat percakapan grup WhatsApp:\n\n${context}\n\n---\n\n${prompt}`
     : prompt;
-  const result = await model.generateContent(fullPrompt);
-  return result.response.text();
+  const response = await ai.models.generateContent({
+    model: "gemini-2.0-flash",
+    contents: fullPrompt,
+  });
+  return response.text;
 }
 
 // Bersihkan teks dari tag @62812xxxx supaya nggak ikut dikirim ke Gemini
