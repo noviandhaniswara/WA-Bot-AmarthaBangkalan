@@ -32,15 +32,32 @@ function formatHistory(groupId) {
   return history.map((h) => `${h.sender}: ${h.text}`).join("\n");
 }
 
-async function askGemini(prompt, context) {
+async function askGemini(prompt, context, retries = 3) {
   const fullPrompt = context
     ? `Berikut adalah riwayat percakapan grup WhatsApp:\n\n${context}\n\n---\n\n${prompt}`
     : prompt;
-  const response = await ai.models.generateContent({
-    model: "gemini-3.8-flash",
-    contents: fullPrompt,
-  });
-  return response.text;
+
+  for (let attempt = 0; attempt < retries; attempt++) {
+    try {
+      const response = await ai.models.generateContent({
+        model: "gemini-3.8-flash",
+        contents: fullPrompt,
+      });
+      return response.text;
+    } catch (err) {
+      const isRetryable =
+        err?.status === 503 || err?.message?.includes("UNAVAILABLE") || err?.message?.includes("high demand");
+      const isLastAttempt = attempt === retries - 1;
+
+      if (!isRetryable || isLastAttempt) {
+        throw err;
+      }
+
+      const waitMs = 2000 * (attempt + 1); // 2s, 4s, 6s
+      console.log(`Gemini sibuk, coba lagi dalam ${waitMs / 1000}s (percobaan ${attempt + 1}/${retries})`);
+      await new Promise((resolve) => setTimeout(resolve, waitMs));
+    }
+  }
 }
 
 // Bersihkan teks dari tag @62812xxxx supaya nggak ikut dikirim ke Gemini
@@ -169,7 +186,11 @@ async function startBot() {
       }
     } catch (err) {
       console.error("Error saat proses pesan:", err);
-      await sock.sendMessage(from, { text: "Maaf, ada error saat memproses permintaan. Coba lagi." });
+      const isBusy = err?.status === 503 || err?.message?.includes("UNAVAILABLE") || err?.message?.includes("high demand");
+      const errorText = isBusy
+        ? "Server AI sedang sibuk, sudah dicoba beberapa kali tapi masih gagal. Coba lagi sebentar lagi ya."
+        : "Maaf, ada error saat memproses permintaan. Coba lagi.";
+      await sock.sendMessage(from, { text: errorText });
     }
   });
 }
