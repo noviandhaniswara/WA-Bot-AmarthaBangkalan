@@ -91,9 +91,21 @@ async function askGeminiWithImage(prompt, imageBase64, mimeType, retries = 3) {
   }
 }
 
-// Bersihkan teks dari tag @62812xxxx supaya nggak ikut dikirim ke Gemini
+// Nama kontak bot ini disimpan di HP, dipakai sebagai cadangan deteksi mention
+// kalau data teknis mention dari WA tidak terbaca (isu umum di Baileys)
+const BOT_DISPLAY_NAME = "Amartha Bangkalan AI";
+
+// Bersihkan teks dari tag @62812xxxx atau @NamaBot supaya nggak ikut dikirim ke Gemini
 function stripMentions(text) {
-  return text.replace(/@\d+/g, "").trim();
+  let cleaned = text.replace(/@\d+/g, "");
+  const namePattern = new RegExp("@" + BOT_DISPLAY_NAME.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+  cleaned = cleaned.replace(namePattern, "");
+  return cleaned.trim();
+}
+
+function startsWithBotMention(text) {
+  const trimmed = text.trim().toLowerCase();
+  return trimmed.startsWith("@" + BOT_DISPLAY_NAME.toLowerCase());
 }
 
 async function startBot() {
@@ -171,10 +183,11 @@ async function startBot() {
     const mentionedJids =
       msg.message.extendedTextMessage?.contextInfo?.mentionedJid || [];
     const isMentioned =
-      botJid && mentionedJids.some((jid) => jid.split("@")[0] === botJid);
+      (botJid && mentionedJids.some((jid) => jid.split("@")[0] === botJid)) ||
+      (isGroup && startsWithBotMention(text));
 
-    if (isGroup && mentionedJids.length > 0) {
-      console.log("Debug mention -> botJid:", botJid, "| mentionedJids:", mentionedJids, "| isMentioned:", isMentioned);
+    if (isGroup) {
+      console.log("Debug mention -> botJid:", botJid, "| mentionedJids:", mentionedJids, "| isMentioned:", isMentioned, "| text:", text);
     }
 
     const command = text.trim().toLowerCase();
