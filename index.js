@@ -91,21 +91,23 @@ async function askGeminiWithImage(prompt, imageBase64, mimeType, retries = 3) {
   }
 }
 
-// Nama kontak bot ini disimpan di HP, dipakai sebagai cadangan deteksi mention
-// kalau data teknis mention dari WA tidak terbaca (isu umum di Baileys)
-const BOT_DISPLAY_NAME = "Amartha Bangkalan AI";
+// Nama panggilan bot ini. Ketik nama ini di mana saja dalam pesan (di grup)
+// untuk memanggil bot, tidak perlu tag/mention resmi WA (karena sistem ID
+// mention WA sekarang kadang tidak bisa dicocokkan dengan reliable).
+const BOT_NAME = "Marley";
+const triggerPattern = new RegExp(`\\b${BOT_NAME}\\b`, "i");
 
-// Bersihkan teks dari tag @62812xxxx atau @NamaBot supaya nggak ikut dikirim ke Gemini
-function stripMentions(text) {
-  let cleaned = text.replace(/@\d+/g, "");
-  const namePattern = new RegExp("@" + BOT_DISPLAY_NAME.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
-  cleaned = cleaned.replace(namePattern, "");
-  return cleaned.trim();
+function containsBotTrigger(text) {
+  return triggerPattern.test(text);
 }
 
-function startsWithBotMention(text) {
-  const trimmed = text.trim().toLowerCase();
-  return trimmed.startsWith("@" + BOT_DISPLAY_NAME.toLowerCase());
+// Bersihkan teks dari kata panggil "Marley" (dan tanda baca setelahnya)
+// serta tag @nomor lama, supaya tidak ikut dikirim ke Gemini
+function stripMentions(text) {
+  let cleaned = text.replace(/@\d+/g, "");
+  cleaned = cleaned.replace(triggerPattern, "");
+  cleaned = cleaned.replace(/^[\s,:.\-]+/, "");
+  return cleaned.trim();
 }
 
 async function startBot() {
@@ -155,12 +157,8 @@ async function startBot() {
     if (imageMessage) {
       const caption = imageMessage.caption || "";
 
-      // Cek mention juga untuk gambar (pakai data teknis WA + fallback nama)
-      const imgMentionedJids =
-        imageMessage.contextInfo?.mentionedJid || [];
-      const imageIsMentioned =
-        (botJid && imgMentionedJids.some((jid) => jid.split("@")[0] === botJid)) ||
-        (isGroup && startsWithBotMention(caption));
+      // Di grup, foto diproses kalau caption-nya menyebut nama bot ("Marley")
+      const imageIsMentioned = isGroup && containsBotTrigger(caption);
 
       // Di grup: cuma proses kalau bot di-mention di caption-nya
       // Di chat pribadi: selalu proses
@@ -195,15 +193,8 @@ async function startBot() {
       addToHistory(from, sender, text);
     }
 
-    const mentionedJids =
-      msg.message.extendedTextMessage?.contextInfo?.mentionedJid || [];
-    const isMentioned =
-      (botJid && mentionedJids.some((jid) => jid.split("@")[0] === botJid)) ||
-      (isGroup && startsWithBotMention(text));
-
-    if (isGroup) {
-      console.log("Debug mention -> botJid:", botJid, "| mentionedJids:", mentionedJids, "| isMentioned:", isMentioned, "| text:", text);
-    }
+    // Bot dipanggil kalau namanya ("Marley") disebut di pesan grup
+    const isMentioned = isGroup && containsBotTrigger(text);
 
     const command = text.trim().toLowerCase();
 
@@ -252,12 +243,12 @@ async function startBot() {
             "/analisa - analisis masalah + saran action plan\n" +
             "/proyeksi - hitung proyeksi dari data di chat\n" +
             "/help - tampilkan menu ini\n\n" +
-            "Atau tag/mention saya langsung diikuti pertanyaan apa saja, saya akan jawab seperti chat biasa.",
+            "Atau sebut nama saya \"Marley\" di pesan kamu diikuti pertanyaan apa saja, saya akan jawab seperti chat biasa.",
         });
       } else if (isGroup && isMentioned) {
         const question = stripMentions(text);
         if (!question) {
-          await sock.sendMessage(from, { text: "Ya, ada yang bisa saya bantu? Tulis pertanyaannya setelah tag saya." });
+          await sock.sendMessage(from, { text: "Ya, ada yang bisa saya bantu? Tulis pertanyaannya setelah nama saya." });
           return;
         }
         const context = formatHistory(from);
