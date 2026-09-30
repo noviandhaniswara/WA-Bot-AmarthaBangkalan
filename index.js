@@ -1,6 +1,9 @@
 import express from "express";
 import qrcode from "qrcode";
 import pino from "pino";
+import fs from "fs/promises";
+import path from "path";
+import { fileURLToPath } from "url";
 import { GoogleGenAI } from "@google/genai";
 import {
   makeWASocket,
@@ -8,6 +11,9 @@ import {
   DisconnectReason,
   downloadMediaMessage,
 } from "@whiskeysockets/baileys";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -22,7 +28,253 @@ let connectionStatus = "menghubungkan...";
 let botJid = null;
 
 // ======================================================
-// RIWAYAT CHAT
+// MEMORY PERSISTENT MARLEY
+// ======================================================
+
+const MEMORY_DIR = path.join(__dirname, "memory");
+const MEMORY_FILE = path.join(MEMORY_DIR, "memories.json");
+
+const DEFAULT_MEMORIES = [
+  {
+    id: "core-001",
+    category: "identity",
+    text: "Marley adalah AI Assistant untuk membantu pekerjaan AM-BM Bangkalan.",
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  },
+  {
+    id: "core-002",
+    category: "terminology",
+    text: "Dalam konteks Amartha, mitra berarti nasabah.",
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  },
+  {
+    id: "core-003",
+    category: "area",
+    text: "Fokus utama Marley adalah monitoring dan analisis Area Bangkalan.",
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  },
+  {
+    id: "core-004",
+    category: "kpi",
+    text: "Growth terdiri dari ETB dan NTB. Portofolio mencakup DPD 0, DPD 1-30, dan DPD 31-90.",
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  },
+];
+
+let memories = [];
+let memoryWriteQueue = Promise.resolve();
+
+async function initMemory() {
+  try {
+    await fs.mkdir(MEMORY_DIR, { recursive: true });
+
+    try {
+      const raw = await fs.readFile(MEMORY_FILE, "utf8");
+      const parsed = JSON.parse(raw);
+      memories = Array.isArray(parsed) ? parsed : [];
+    } catch {
+      memories = DEFAULT_MEMORIES;
+      await saveMemories();
+    }
+
+    console.log(`Memory Marley siap: ${memories.length} memory.`);
+  } catch (err) {
+    console.error("Gagal menyiapkan memory Marley:", err);
+    memories = DEFAULT_MEMORIES;
+  }
+}
+
+function saveMemories() {
+  const payload = JSON.stringify(memories, null, 2);
+
+  memoryWriteQueue = memoryWriteQueue
+    .catch(() => {})
+    .then(() => fs.writeFile(MEMORY_FILE, payload, "utf8"));
+
+  return memoryWriteQueue;
+}
+
+function makeMemoryId() {
+  return `mem-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+}
+
+async function addMemory(text, category = "general") {
+  const cleanText = String(text || "").trim();
+  if (!cleanText) return null;
+
+  const now = new Date().toISOString();
+  const memory = {
+    id: makeMemoryId(),
+    category: String(category || "general").trim().toLowerCase(),
+    text: cleanText,
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  memories.push(memory);
+  await saveMemories();
+  return memory;
+}
+
+async function deleteMemoriesByIds(ids) {
+  const idSet = new Set(ids);
+  const before = memories.length;
+  memories = memories.filter((m) => !idSet.has(m.id));
+  const deleted = before - memories.length;
+
+  if (deleted > 0) {
+    await saveMemories();
+  }
+
+  return deleted;
+}
+
+function normalizeForSearch(value) {
+  return String(value || "")
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "");
+}
+
+function getRelevantMemories(query, limit = 12) {
+  if (!memories.length) return [];
+
+  const q = normalizeForSearch(query);
+  const tokens = q
+    .split(/\s+/)
+    .map((x) => x.trim())
+    .filter((x) => x.length >= 3);
+
+  const scored = memories.map((memory) => {
+    const haystack = normalizeForSearch(
+      `${memory.category} ${memory.text}`
+    );
+
+    let score = 0;
+
+    if (q && haystack.includes(q)) score += 10;
+
+    for (const token of tokens) {
+      if (haystack.includes(token)) score += 1;
+    }
+
+    return { memory, score };
+  });
+
+  return scored
+    .filter((x) => x.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit)
+    .map((x) => x.memory);
+}
+
+function formatMemoriesForPrompt(query) {
+  const relevant = getRelevantMemories(query, 12);
+
+  if (!relevant.length) return "";
+
+  return relevant
+    .map(
+      (m, i) =>
+        `${i + 1}. [${m.category}] ${m.text}`
+    )
+    .join("\n");
+}
+
+function formatAllMemories(limit = 30) {
+  if (!memories.length) return "Belum ada memory tersimpan.";
+
+  return memories
+    .slice(-limit)
+    .map(
+      (m, i) =>
+        `${i + 1}. [${m.category}] ${m.text}\n   ID: ${m.id}`
+    )
+    .join("\n");
+}
+
+function searchMemories(query, limit = 20) {
+  const results = getRelevantMemories(query, limit);
+
+  if (!results.length) {
+    return "Tidak ditemukan memory yang relevan.";
+  }
+
+  return results
+    .map(
+      (m, i) =>
+        `${i + 1}. [${m.category}] ${m.text}\n   ID: ${m.id}`
+    )
+    .join("\n");
+}
+
+async function forgetMemories(query) {
+  const q = normalizeForSearch(query);
+
+  if (!q) return 0;
+
+  const candidates = memories.filter((m) => {
+    const haystack = normalizeForSearch(
+      `${m.category} ${m.text}`
+    );
+    return haystack.includes(q);
+  });
+
+  return deleteMemoriesByIds(
+    candidates.map((m) => m.id)
+  );
+}
+
+function parseRememberCommand(text) {
+  const match = text.match(
+    /^\s*(?:ingat|simpan memory|simpan|remember)\s*[:\-]?\s*(.+)$/i
+  );
+
+  if (!match) return null;
+
+  let content = match[1].trim();
+  let category = "general";
+
+  const categoryMatch = content.match(
+    /^\[([^\]]+)\]\s*(.+)$/
+  );
+
+  if (categoryMatch) {
+    category = categoryMatch[1].trim().toLowerCase();
+    content = categoryMatch[2].trim();
+  }
+
+  return { content, category };
+}
+
+function parseForgetCommand(text) {
+  const match = text.match(
+    /^\s*(?:lupakan|hapus memory|forget)\s*[:\-]?\s*(.+)$/i
+  );
+
+  return match ? match[1].trim() : null;
+}
+
+function isMemoryListCommand(text) {
+  return /^\s*(?:memory|memori|lihat memory|lihat memori)\s*$/i.test(
+    text
+  );
+}
+
+function parseMemorySearchCommand(text) {
+  const match = text.match(
+    /^\s*(?:cari memory|cari memori|search memory|search memori)\s*[:\-]?\s*(.+)$/i
+  );
+
+  return match ? match[1].trim() : null;
+}
+
+// ======================================================
+// RIWAYAT CHAT GRUP
 // ======================================================
 
 const groupHistory = new Map();
@@ -59,15 +311,19 @@ function formatHistory(groupId) {
 // ======================================================
 
 async function askGemini(prompt, context, retries = 3) {
-  const fullPrompt = context
-    ? `Berikut adalah riwayat percakapan grup WhatsApp:
+  const memoryContext = formatMemoriesForPrompt(prompt);
 
-${context}
+  const memoryBlock = memoryContext
+    ? `\n\nMEMORY MARLEY YANG RELEVAN:\n${memoryContext}\n`
+    : "";
 
----
-
-${prompt}`
-    : prompt;
+  const fullPrompt = `${
+    memoryBlock
+  }\n\n${
+    context
+      ? `Berikut adalah riwayat percakapan grup WhatsApp:\n\n${context}\n\n---\n\n`
+      : ""
+  }${prompt}`;
 
   for (let attempt = 0; attempt < retries; attempt++) {
     try {
@@ -92,12 +348,12 @@ ${prompt}`
       const waitMs = 2000 * (attempt + 1);
 
       console.log(
-        `Gemini sibuk, coba lagi dalam ${
-          waitMs / 1000
-        }s (percobaan ${attempt + 1}/${retries})`
+        `Gemini sibuk, coba lagi dalam ${waitMs / 1000}s (percobaan ${attempt + 1}/${retries})`
       );
 
-      await new Promise((resolve) => setTimeout(resolve, waitMs));
+      await new Promise((resolve) =>
+        setTimeout(resolve, waitMs)
+      );
     }
   }
 }
@@ -108,6 +364,12 @@ async function askGeminiWithImage(
   mimeType,
   retries = 3
 ) {
+  const memoryContext = formatMemoriesForPrompt(prompt);
+
+  const memoryInstruction = memoryContext
+    ? `Memory Marley yang relevan:\n${memoryContext}\n\n`
+    : "";
+
   for (let attempt = 0; attempt < retries; attempt++) {
     try {
       const response = await ai.models.generateContent({
@@ -118,8 +380,10 @@ async function askGeminiWithImage(
             parts: [
               {
                 text:
-                  prompt ||
-                  "Jelaskan dan analisis isi gambar ini.",
+                  `${memoryInstruction}${
+                    prompt ||
+                    "Jelaskan dan analisis isi gambar ini."
+                  }`,
               },
               {
                 inlineData: {
@@ -147,11 +411,9 @@ async function askGeminiWithImage(
 
       const waitMs = 2000 * (attempt + 1);
 
-      console.log(
-        `Gemini gambar sibuk, retry dalam ${waitMs / 1000}s`
+      await new Promise((resolve) =>
+        setTimeout(resolve, waitMs)
       );
-
-      await new Promise((resolve) => setTimeout(resolve, waitMs));
     }
   }
 }
@@ -162,21 +424,6 @@ async function askGeminiWithImage(
 
 const BOT_NAME = "Marley";
 
-/*
- * Trigger Marley dibuat fleksibel.
- *
- * Contoh yang akan terdeteksi:
- *
- * Marley
- * marley
- * MARLEY
- * Marley tolong bantu
- * @Marley tolong bantu
- * Marley, analisa data ini
- *
- * Tidak bergantung pada mentionedJids.
- */
-
 const triggerPattern = new RegExp(
   `(^|[\\s@.,!?;:()\\[\\]{}'"-])${BOT_NAME}(?=$|[\\s@.,!?;:()\\[\\]{}'"-])`,
   "i"
@@ -184,29 +431,21 @@ const triggerPattern = new RegExp(
 
 function containsBotTrigger(text) {
   if (!text) return false;
-
   return triggerPattern.test(text);
 }
-
-// ======================================================
-// MEMBERSIHKAN PESAN
-// ======================================================
 
 function stripMentions(text) {
   if (!text) return "";
 
   let cleaned = text;
 
-  // Hapus @nomor
   cleaned = cleaned.replace(/@\d+/g, "");
 
-  // Hapus nama Marley
   cleaned = cleaned.replace(
     new RegExp(`\\b${BOT_NAME}\\b`, "gi"),
     ""
   );
 
-  // Bersihkan karakter awal
   cleaned = cleaned.replace(/^[\s,:.\-!?]+/, "");
 
   return cleaned.trim();
@@ -227,10 +466,6 @@ async function startBot() {
 
   sock.ev.on("creds.update", saveCreds);
 
-  // ====================================================
-  // CONNECTION
-  // ====================================================
-
   sock.ev.on("connection.update", (update) => {
     const { connection, qr, lastDisconnect } = update;
 
@@ -242,32 +477,12 @@ async function startBot() {
     if (connection === "open") {
       connectionStatus = "terhubung";
       latestQR = null;
-
-      /*
-       * Simpan nomor bot sendiri.
-       *
-       * Contoh:
-       * 62895379899997@s.whatsapp.net
-       */
-
       botJid = sock.user?.id?.split(":")[0] || null;
 
-      console.log(
-        "Bot berhasil terhubung ke WhatsApp!"
-      );
-
-      console.log(
-        "Bot JID:",
-        botJid
-      );
-
-      console.log(
-        `Nama bot: ${BOT_NAME}`
-      );
-
-      console.log(
-        "Trigger grup: nama 'Marley' akan digunakan sebagai pemanggil."
-      );
+      console.log("Bot berhasil terhubung ke WhatsApp!");
+      console.log("Bot JID:", botJid);
+      console.log(`Nama bot: ${BOT_NAME}`);
+      console.log(`Memory aktif: ${memories.length}`);
     }
 
     if (connection === "close") {
@@ -275,8 +490,7 @@ async function startBot() {
         lastDisconnect?.error?.output?.statusCode !==
         DisconnectReason.loggedOut;
 
-      connectionStatus =
-        "terputus, mencoba lagi...";
+      connectionStatus = "terputus, mencoba lagi...";
 
       console.log(
         "Koneksi terputus, reconnect:",
@@ -289,22 +503,15 @@ async function startBot() {
     }
   });
 
-  // ====================================================
-  // PESAN MASUK
-  // ====================================================
-
   sock.ev.on(
     "messages.upsert",
     async ({ messages }) => {
       const msg = messages[0];
 
       if (!msg?.message) return;
-
-      // Jangan proses pesan yang dikirim bot sendiri
       if (msg.key.fromMe) return;
 
       const from = msg.key.remoteJid;
-
       if (!from) return;
 
       const isGroup = from.endsWith("@g.us");
@@ -314,36 +521,14 @@ async function startBot() {
         msg.key.participant ||
         from;
 
-      // ==================================================
-      // AMBIL TEKS PESAN
-      // ==================================================
-
       const text =
         msg.message.conversation ||
         msg.message.extendedTextMessage?.text ||
         "";
 
-      // ==================================================
-      // CEK MENTION RESMI WHATSAPP
-      // ==================================================
-
       const mentionedJids =
         msg.message.extendedTextMessage?.contextInfo
           ?.mentionedJid || [];
-
-      /*
-       * Jangan jadikan mentionedJids sebagai syarat utama.
-       *
-       * Karena dari log kamu:
-       *
-       * mentionedJids: []
-       *
-       * padahal user mengetik:
-       *
-       * Marley
-       *
-       * Jadi Marley tetap diproses berdasarkan teks.
-       */
 
       const textTrigger = containsBotTrigger(text);
 
@@ -353,57 +538,20 @@ async function startBot() {
           jid.includes(botJid)
         );
 
-      // Trigger final
       const isMentioned =
         isGroup &&
         (textTrigger || officialMention);
 
-      // ==================================================
-      // DEBUG
-      // ==================================================
-
       if (isGroup) {
-        console.log(
-          "========================================"
-        );
-
-        console.log(
-          "DEBUG PESAN GRUP"
-        );
-
-        console.log(
-          "text:",
-          JSON.stringify(text)
-        );
-
-        console.log(
-          "botJid:",
-          botJid
-        );
-
-        console.log(
-          "mentionedJids:",
-          mentionedJids
-        );
-
-        console.log(
-          "textTrigger:",
-          textTrigger
-        );
-
-        console.log(
-          "officialMention:",
-          officialMention
-        );
-
-        console.log(
-          "isMentioned:",
-          isMentioned
-        );
-
-        console.log(
-          "========================================"
-        );
+        console.log("========================================");
+        console.log("DEBUG PESAN GRUP");
+        console.log("text:", JSON.stringify(text));
+        console.log("botJid:", botJid);
+        console.log("mentionedJids:", mentionedJids);
+        console.log("textTrigger:", textTrigger);
+        console.log("officialMention:", officialMention);
+        console.log("isMentioned:", isMentioned);
+        console.log("========================================");
       }
 
       // ==================================================
@@ -414,36 +562,25 @@ async function startBot() {
         msg.message.imageMessage;
 
       if (imageMessage) {
-        const caption =
-          imageMessage.caption || "";
+        const caption = imageMessage.caption || "";
+
+        const imageMentionedJids =
+          imageMessage.contextInfo?.mentionedJid || [];
 
         const imageTextTrigger =
           containsBotTrigger(caption);
 
         const imageOfficialMention =
           botJid &&
-          (
-            msg.message.imageMessage
-              ?.contextInfo
-              ?.mentionedJid || []
-          ).some((jid) =>
+          imageMentionedJids.some((jid) =>
             jid.includes(botJid)
           );
 
         const imageIsMentioned =
           isGroup &&
-          (imageTextTrigger ||
-            imageOfficialMention);
+          (imageTextTrigger || imageOfficialMention);
 
-        /*
-         * Di grup:
-         * gambar hanya diproses jika Marley dipanggil.
-         */
-
-        if (
-          isGroup &&
-          !imageIsMentioned
-        ) {
+        if (isGroup && !imageIsMentioned) {
           return;
         }
 
@@ -467,13 +604,10 @@ async function startBot() {
               ? stripMentions(caption)
               : caption;
 
-          await sock.sendMessage(
-            from,
-            {
-              text:
-                "Sedang menganalisis gambar, tunggu sebentar...",
-            }
-          );
+          await sock.sendMessage(from, {
+            text:
+              "Sedang menganalisis gambar, tunggu sebentar...",
+          });
 
           const result =
             await askGeminiWithImage(
@@ -482,81 +616,140 @@ async function startBot() {
               mimeType
             );
 
-          await sock.sendMessage(
-            from,
-            {
-              text: result,
-            }
-          );
+          await sock.sendMessage(from, {
+            text: result,
+          });
         } catch (err) {
           console.error(
             "Error saat proses gambar:",
             err
           );
 
-          await sock.sendMessage(
-            from,
-            {
-              text:
-                "Maaf, gagal menganalisis gambar ini. Coba lagi.",
-            }
-          );
+          await sock.sendMessage(from, {
+            text:
+              "Maaf, gagal menganalisis gambar ini. Coba lagi.",
+          });
         }
 
         return;
       }
 
-      // ==================================================
-      // PESAN TANPA TEKS
-      // ==================================================
-
       if (!text) return;
 
-      // ==================================================
-      // SIMPAN HISTORY
-      // ==================================================
-
       if (isGroup) {
-        addToHistory(
-          from,
-          sender,
-          text
-        );
+        addToHistory(from, sender, text);
       }
 
-      // ==================================================
-      // COMMAND
-      // ==================================================
-
-      const command =
-        text.trim().toLowerCase();
-
       try {
-        // ================================================
-        // RANGKUM
-        // ================================================
+        // ==================================================
+        // MEMORY: SIMPAN
+        // ==================================================
+
+        const remember = parseRememberCommand(text);
+
+        if (isGroup && isMentioned && remember) {
+          if (!remember.content) {
+            await sock.sendMessage(from, {
+              text:
+                "Format: Marley ingat: [kategori] isi memory",
+            });
+            return;
+          }
+
+          const saved = await addMemory(
+            remember.content,
+            remember.category
+          );
+
+          await sock.sendMessage(from, {
+            text:
+              `Siap, saya ingat.\n\n[${saved.category}] ${saved.text}`,
+          });
+
+          console.log(
+            "Memory baru disimpan:",
+            saved
+          );
+
+          return;
+        }
+
+        // ==================================================
+        // MEMORY: LIHAT SEMUA
+        // ==================================================
+
+        if (isGroup && isMentioned && isMemoryListCommand(stripMentions(text))) {
+          await sock.sendMessage(from, {
+            text:
+              `Memory Marley (${memories.length}):\n\n${formatAllMemories()}`,
+          });
+          return;
+        }
+
+        // ==================================================
+        // MEMORY: CARI
+        // ==================================================
+
+        const memorySearch =
+          parseMemorySearchCommand(
+            stripMentions(text)
+          );
+
+        if (isGroup && isMentioned && memorySearch) {
+          const result = searchMemories(memorySearch);
+
+          await sock.sendMessage(from, {
+            text:
+              `Hasil pencarian memory untuk "${memorySearch}":\n\n${result}`,
+          });
+
+          return;
+        }
+
+        // ==================================================
+        // MEMORY: LUPAKAN
+        // ==================================================
+
+        const forgetQuery =
+          parseForgetCommand(
+            stripMentions(text)
+          );
+
+        if (isGroup && isMentioned && forgetQuery) {
+          const deleted =
+            await forgetMemories(forgetQuery);
+
+          await sock.sendMessage(from, {
+            text:
+              deleted > 0
+                ? `Baik, ${deleted} memory yang cocok sudah saya lupakan.`
+                : "Saya tidak menemukan memory yang cocok untuk dilupakan.",
+          });
+
+          return;
+        }
+
+        // ==================================================
+        // COMMAND
+        // ==================================================
+
+        const command =
+          text.trim().toLowerCase();
 
         if (command === "/rangkum") {
-          await sock.sendMessage(
-            from,
-            {
-              text:
-                "Sedang merangkum, tunggu sebentar...",
-            }
-          );
+          await sock.sendMessage(from, {
+            text:
+              "Sedang merangkum, tunggu sebentar...",
+          });
 
           const context =
             formatHistory(from);
 
           if (!context) {
-            await sock.sendMessage(
-              from,
-              {
-                text:
-                  "Belum ada riwayat percakapan yang bisa dirangkum.",
-              }
-            );
-
+            await sock.sendMessage(from, {
+              text:
+                "Belum ada riwayat percakapan yang bisa dirangkum.",
+            });
             return;
           }
 
@@ -566,40 +759,23 @@ async function startBot() {
               context
             );
 
-          await sock.sendMessage(
-            from,
-            {
-              text: result,
-            }
-          );
-
-        // ================================================
-        // ANALISA
-        // ================================================
-
-        } else if (
-          command === "/analisa"
-        ) {
-          await sock.sendMessage(
-            from,
-            {
-              text:
-                "Sedang menganalisis, tunggu sebentar...",
-            }
-          );
+          await sock.sendMessage(from, {
+            text: result,
+          });
+        } else if (command === "/analisa") {
+          await sock.sendMessage(from, {
+            text:
+              "Sedang menganalisis, tunggu sebentar...",
+          });
 
           const context =
             formatHistory(from);
 
           if (!context) {
-            await sock.sendMessage(
-              from,
-              {
-                text:
-                  "Belum ada riwayat percakapan yang bisa dianalisis.",
-              }
-            );
-
+            await sock.sendMessage(from, {
+              text:
+                "Belum ada riwayat percakapan yang bisa dianalisis.",
+            });
             return;
           }
 
@@ -609,40 +785,23 @@ async function startBot() {
               context
             );
 
-          await sock.sendMessage(
-            from,
-            {
-              text: result,
-            }
-          );
-
-        // ================================================
-        // PROYEKSI
-        // ================================================
-
-        } else if (
-          command === "/proyeksi"
-        ) {
-          await sock.sendMessage(
-            from,
-            {
-              text:
-                "Sedang menghitung proyeksi, tunggu sebentar...",
-            }
-          );
+          await sock.sendMessage(from, {
+            text: result,
+          });
+        } else if (command === "/proyeksi") {
+          await sock.sendMessage(from, {
+            text:
+              "Sedang menghitung proyeksi, tunggu sebentar...",
+          });
 
           const context =
             formatHistory(from);
 
           if (!context) {
-            await sock.sendMessage(
-              from,
-              {
-                text:
-                  "Belum ada riwayat percakapan yang bisa dihitung.",
-              }
-            );
-
+            await sock.sendMessage(from, {
+              text:
+                "Belum ada riwayat percakapan yang bisa dihitung.",
+            });
             return;
           }
 
@@ -652,69 +811,41 @@ async function startBot() {
               context
             );
 
-          await sock.sendMessage(
-            from,
-            {
-              text: result,
-            }
-          );
-
-        // ================================================
-        // HELP
-        // ================================================
-
+          await sock.sendMessage(from, {
+            text: result,
+          });
         } else if (
           command === "/help" ||
           command === "/menu"
         ) {
-          await sock.sendMessage(
-            from,
-            {
-              text:
-                "Perintah yang tersedia:\n\n" +
-                "/rangkum - merangkum diskusi grup\n" +
-                "/analisa - analisis masalah + saran action plan\n" +
-                "/proyeksi - hitung proyeksi dari data di chat\n" +
-                "/help - tampilkan menu ini\n\n" +
-                'Atau sebut nama saya "Marley" di pesan kamu diikuti pertanyaan apa saja, saya akan jawab seperti chat biasa.',
-            }
-          );
-
-        // ================================================
-        // MARLEY DI GRUP
-        // ================================================
-
-        } else if (
-          isGroup &&
-          isMentioned
-        ) {
-
-          /*
-           * Hapus kata Marley / @nomor
-           * sebelum dikirim ke Gemini.
-           */
-
+          await sock.sendMessage(from, {
+            text:
+              "Perintah yang tersedia:\n\n" +
+              "/rangkum - merangkum diskusi grup\n" +
+              "/analisa - analisis masalah + saran action plan\n" +
+              "/proyeksi - hitung proyeksi dari data di chat\n" +
+              "/help - tampilkan menu ini\n\n" +
+              "Memory Marley:\n" +
+              "Marley ingat: ... - simpan memory\n" +
+              "Marley memory - lihat memory\n" +
+              "Marley cari memory: ... - cari memory\n" +
+              "Marley lupakan: ... - hapus memory\n\n" +
+              'Atau sebut nama saya "Marley" diikuti pertanyaan apa saja.',
+          });
+        } else if (isGroup && isMentioned) {
           const question =
             stripMentions(text);
 
           console.log(
-            "Marley dipanggil."
-          );
-
-          console.log(
-            "Pertanyaan setelah dibersihkan:",
+            "Marley dipanggil. Pertanyaan:",
             JSON.stringify(question)
           );
 
           if (!question) {
-            await sock.sendMessage(
-              from,
-              {
-                text:
-                  "Ya, ada yang bisa saya bantu? Tulis pertanyaannya setelah nama saya.",
-              }
-            );
-
+            await sock.sendMessage(from, {
+              text:
+                "Ya, ada yang bisa saya bantu? Tulis pertanyaannya setelah nama saya.",
+            });
             return;
           }
 
@@ -727,32 +858,17 @@ async function startBot() {
               context
             );
 
-          await sock.sendMessage(
-            from,
-            {
-              text: result,
-            }
-          );
-
-        // ================================================
-        // CHAT PRIBADI
-        // ================================================
-
+          await sock.sendMessage(from, {
+            text: result,
+          });
         } else if (!isGroup) {
           const result =
-            await askGemini(
-              text,
-              ""
-            );
+            await askGemini(text, "");
 
-          await sock.sendMessage(
-            from,
-            {
-              text: result,
-            }
-          );
+          await sock.sendMessage(from, {
+            text: result,
+          });
         }
-
       } catch (err) {
         console.error(
           "Error saat proses pesan:",
@@ -764,17 +880,13 @@ async function startBot() {
           err?.message?.includes("UNAVAILABLE") ||
           err?.message?.includes("high demand");
 
-        const errorText =
-          isBusy
-            ? "Server AI sedang sibuk, sudah dicoba beberapa kali tapi masih gagal. Coba lagi sebentar lagi ya."
-            : "Maaf, ada error saat memproses permintaan. Coba lagi.";
+        const errorText = isBusy
+          ? "Server AI sedang sibuk, sudah dicoba beberapa kali tapi masih gagal. Coba lagi sebentar lagi ya."
+          : "Maaf, ada error saat memproses permintaan. Coba lagi.";
 
-        await sock.sendMessage(
-          from,
-          {
-            text: errorText,
-          }
-        );
+        await sock.sendMessage(from, {
+          text: errorText,
+        });
       }
     }
   );
@@ -789,8 +901,8 @@ app.get("/", async (req, res) => {
     res.send(`
       <h2>Status: ${connectionStatus}</h2>
       <p>Bot Marley aktif dan siap menerima perintah di grup.</p>
+      <p>Memory aktif: ${memories.length}</p>
     `);
-
     return;
   }
 
@@ -799,7 +911,6 @@ app.get("/", async (req, res) => {
       <h2>Status: ${connectionStatus}</h2>
       <p>QR belum siap, refresh halaman ini beberapa detik lagi.</p>
     `);
-
     return;
   }
 
@@ -808,44 +919,21 @@ app.get("/", async (req, res) => {
 
   res.send(`
     <html>
-      <body
-        style="
-          text-align:center;
-          font-family:sans-serif;
-        "
-      >
+      <body style="text-align:center; font-family:sans-serif;">
         <h2>Scan QR ini dengan WhatsApp</h2>
-
         <img src="${qrImage}" />
-
         <p>Status: ${connectionStatus}</p>
-
         <script>
-          setTimeout(
-            () => location.reload(),
-            5000
-          );
+          setTimeout(() => location.reload(), 5000)
         </script>
       </body>
     </html>
   `);
 });
 
-// ======================================================
-// SERVER
-// ======================================================
+app.listen(PORT, () => {
+  console.log(`Server jalan di port ${PORT}`);
+});
 
-app.listen(
-  PORT,
-  () => {
-    console.log(
-      `Server jalan di port ${PORT}`
-    );
-  }
-);
-
-// ======================================================
-// START
-// ======================================================
-
-startBot();
+await initMemory();
+await startBot();
