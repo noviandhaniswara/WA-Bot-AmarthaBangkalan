@@ -5,6 +5,8 @@ import fs from "fs/promises";
 import path from "path";
 import { fileURLToPath } from "url";
 import { GoogleGenAI } from "@google/genai";
+import * as XLSX from "xlsx";
+import sharp from "sharp";
 import {
   makeWASocket,
   useMultiFileAuthState,
@@ -818,6 +820,351 @@ async function processIncomingDailyReport(sock, from, sender, text) {
   return true;
 }
 
+
+// ======================================================
+// EXCEL / CSV / GOOGLE SHEETS ENGINE V4
+// ======================================================
+
+const spreadsheetSessions = new Map();
+const SPREADSHEET_DIR = path.join(__dirname, "data", "spreadsheet_cache");
+
+async function ensureSpreadsheetDir() {
+  await fs.mkdir(SPREADSHEET_DIR, { recursive: true });
+}
+
+function normalizeHeader(value) {
+  return String(value ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "_")
+    .replace(/[^a-z0-9_]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+}
+
+function normalizeRows(rawRows) {
+  if (!Array.isArray(rawRows) || !rawRows.length) return [];
+  const headerRow = rawRows[0].map((v) => normalizeHeader(v));
+  return rawRows.slice(1).map((row) => {
+    const obj = {};
+    headerRow.forEach((key, i) => {
+      if (key) obj[key] = row[i] ?? null;
+    });
+    return obj;
+  });
+}
+
+function isNumericValue(value) {
+  if (typeof value === "number" && Number.isFinite(value)) return true;
+  if (typeof value !== "string") return false;
+  const cleaned = value.replace(/[%,$]/g, "").replace(/\./g, "").replace(/,/g, ".").trim();
+  return cleaned !== "" && Number.isFinite(Number(cleaned));
+}
+
+function toNumber(value) {
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  if (value === null || value === undefined || value === "") return null;
+  const s = String(value).trim().replace(/\s/g, "");
+  if (!s) return null;
+  if (/^-?\d{1,3}(\.\d{3})+(,\d+)?$/.test(s)) {
+    const n = Number(s.replace(/\./g, "").replace(",", "."));
+    return Number.isFinite(n) ? n : null;
+  }
+  const n = Number(s.replace(/,/g, ""));
+  return Number.isFinite(n) ? n : null;
+}
+
+function findColumn(columns, candidates) {
+  const normalized = columns.map((c) => normalizeHeader(c));
+  for (const candidate of candidates) {
+    const idx = normalized.indexOf(normalizeHeader(candidate));
+    if (idx >= 0) return normalized[idx];
+  }
+  return null;
+}
+
+function detectDatasetColumns(columns) {
+  return {
+    point: findColumn(columns, ["branch_name", "point", "point_name", "branch"]),
+    bp: findColumn(columns, ["bp_username", "agent_fullname", "bp_name", "bp"]),
+    customer: findColumn(columns, ["customer_name", "customer", "mitra_name"]),
+    dpdOld: findColumn(columns, ["dpd_old"]),
+    dpdNew: findColumn(columns, ["dpd_new"]),
+    osOld: findColumn(columns, ["os_old"]),
+    osNew: findColumn(columns, ["os_new"]),
+    installment: findColumn(columns, ["installment_amount"]),
+    payment: findColumn(columns, ["total_payment", "total_payment_min_1x"]),
+    paymentMin1x: findColumn(columns, ["payment_min_1x", "total_payment_min_1x"]),
+    arrears: findColumn(columns, ["total_tunggakan"]),
+    movement: findColumn(columns, ["movement_label"]),
+    loanState: findColumn(columns, ["loan_state"]),
+    loanKind: findColumn(columns, ["loan_kind"]),
+    group: findColumn(columns, ["group_name"]),
+  };
+}
+
+function buildDatasetFromWorkbook(workbook, sourceName) {
+  const sheets = workbook.SheetNames.map((name) => {
+    const ws = workbook.Sheets[name];
+    const matrix = XLSX.utils.sheet_to_json(ws, { header: 1, defval: null, raw: true });
+    const rows = normalizeRows(matrix);
+    const columns = rows.length ? Object.keys(rows[0]) : (matrix[0] || []).map(normalizeHeader).filter(Boolean);
+    return {
+      name,
+      rows,
+      columns,
+      rowCount: rows.length,
+      columnsCount: columns.length,
+      detected: detectDatasetColumns(columns),
+    };
+  });
+  return { sourceName, loadedAt: Date.now(), sheets };
+}
+
+function activeSheetFor(session, preferredName = null) {
+  if (!session) return null;
+  if (preferredName) {
+    const exact = session.sheets.find((s) => s.name.toLowerCase() === preferredName.toLowerCase());
+    if (exact) return exact;
+  }
+  return session.sheets[0] || null;
+}
+
+function formatCompactNumber(value) {
+  if (value === null || value === undefined || !Number.isFinite(value)) return "-";
+  return new Intl.NumberFormat("id-ID", { maximumFractionDigits: 0 }).format(value);
+}
+
+function formatPct(value) {
+  if (!Number.isFinite(value)) return "-";
+  return `${(value * 100).toFixed(2)}%`;
+}
+
+function summarizeSheet(sheet) {
+  const d = sheet.detected;
+  const pointValues = d.point ? new Set(sheet.rows.map((r) => r[d.point]).filter(Boolean)) : new Set();
+  const movements = d.movement ? new Map() : null;
+  if (movements) {
+    for (const row of sheet.rows) {
+      const key = row[d.movement] || "(blank)";
+      movements.set(key, (movements.get(key) || 0) + 1);
+    }
+  }
+  return {
+    rows: sheet.rowCount,
+    columns: sheet.columnsCount,
+    points: pointValues.size,
+    pointSample: [...pointValues].slice(0, 12),
+    movements: movements ? [...movements.entries()].sort((a,b)=>b[1]-a[1]).slice(0,10) : [],
+    detected: d,
+  };
+}
+
+function repaymentSummary(sheet, pointFilter = null) {
+  const d = sheet.detected;
+  if (!d.dpdOld || !d.dpdNew || !d.payment) return null;
+  const rows = pointFilter
+    ? sheet.rows.filter((r) => String(r[d.point] || "").toLowerCase() === pointFilter.toLowerCase())
+    : sheet.rows;
+  let current = 0, paid = 0, paidAmount = 0, os = 0;
+  for (const r of rows) {
+    const old = toNumber(r[d.dpdOld]);
+    const payment = toNumber(r[d.payment]);
+    const osNew = toNumber(d.osNew ? r[d.osNew] : null);
+    if (old === 0) {
+      current += 1;
+      if ((payment || 0) > 0) paid += 1;
+      paidAmount += payment || 0;
+      os += osNew || 0;
+    }
+  }
+  return { rows: rows.length, current, paid, repayment: current ? paid/current : null, paidAmount, os };
+}
+
+function topPointsByMetric(sheet, metric = "payment") {
+  const d = sheet.detected;
+  if (!d.point) return [];
+  const map = new Map();
+  for (const row of sheet.rows) {
+    const point = String(row[d.point] || "Tidak diketahui");
+    let value = 0;
+    if (metric === "payment") value = toNumber(row[d.payment]) || 0;
+    else if (metric === "arrears") value = toNumber(row[d.arrears]) || 0;
+    else if (metric === "os") value = toNumber(row[d.osNew]) || 0;
+    else if (metric === "rows") value = 1;
+    map.set(point, (map.get(point) || 0) + value);
+  }
+  return [...map.entries()].sort((a,b)=>b[1]-a[1]).slice(0,10);
+}
+
+function makeChartSvg(title, labels, values, unit = "") {
+  const width = 1000, height = 560, left = 100, right = 40, top = 80, bottom = 130;
+  const chartW = width-left-right, chartH = height-top-bottom;
+  const max = Math.max(...values, 1);
+  const gap = chartW / Math.max(labels.length, 1);
+  const barW = Math.max(20, gap * 0.62);
+  const bars = labels.map((label, i) => {
+    const h = (values[i] / max) * (chartH - 30);
+    const x = left + i*gap + (gap-barW)/2;
+    const y = top + chartH - h;
+    const safeLabel = String(label).slice(0, 18).replace(/&/g,"&amp;").replace(/</g,"&lt;");
+    return `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${barW.toFixed(1)}" height="${h.toFixed(1)}" rx="8"/><text x="${(x+barW/2).toFixed(1)}" y="${(y-10).toFixed(1)}" text-anchor="middle" font-size="16">${formatCompactNumber(values[i])}${unit}</text><text x="${(x+barW/2).toFixed(1)}" y="${height-75}" text-anchor="middle" font-size="14" transform="rotate(-35 ${(x+barW/2).toFixed(1)} ${height-75})">${safeLabel}</text>`;
+  }).join("");
+  const safeTitle = title.replace(/&/g,"&amp;").replace(/</g,"&lt;");
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}"><rect width="100%" height="100%" fill="white"/><text x="${width/2}" y="42" text-anchor="middle" font-size="26" font-weight="700">${safeTitle}</text><line x1="${left}" y1="${top+chartH}" x2="${width-right}" y2="${top+chartH}" stroke="#555"/>${bars}</svg>`;
+}
+
+async function makeChartBuffer(title, labels, values, unit = "") {
+  const svg = makeChartSvg(title, labels, values, unit);
+  return sharp(Buffer.from(svg)).png().toBuffer();
+}
+
+function listSpreadsheetStatus(session) {
+  if (!session) return "Belum ada spreadsheet yang dimuat. Kirim Excel/CSV atau link Google Sheets terlebih dahulu.";
+  const lines = session.sheets.map((s, i) => `${i+1}. ${s.name} — ${s.rowCount.toLocaleString("id-ID")} baris × ${s.columnsCount} kolom`);
+  return `📊 *SPREADSHEET MARLEY*\nSumber: ${session.sourceName}\n\n${lines.join("\n")}\n\nGunakan /data untuk ringkasan atau /grafik untuk grafik.`;
+}
+
+async function loadSpreadsheetBuffer(buffer, sourceName) {
+  await ensureSpreadsheetDir();
+  const workbook = XLSX.read(buffer, { type: "buffer", cellDates: true, raw: true });
+  return buildDatasetFromWorkbook(workbook, sourceName);
+}
+
+function extractGoogleSheetInfo(url) {
+  const match = String(url).match(/docs\.google\.com\/spreadsheets\/d\/([a-zA-Z0-9_-]+)/);
+  if (!match) return null;
+  const gidMatch = String(url).match(/[?#&]gid=(\d+)/);
+  return { id: match[1], gid: gidMatch ? gidMatch[1] : null };
+}
+
+async function loadPublicGoogleSheet(url) {
+  const info = extractGoogleSheetInfo(url);
+  if (!info) throw new Error("Link Google Sheets tidak dikenali.");
+  const exportUrl = `https://docs.google.com/spreadsheets/d/${info.id}/export?format=xlsx${info.gid ? `&gid=${info.gid}` : ""}`;
+  const response = await fetch(exportUrl, { redirect: "follow" });
+  if (!response.ok) throw new Error(`Google Sheets mengembalikan HTTP ${response.status}.`);
+  const contentType = response.headers.get("content-type") || "";
+  const buffer = Buffer.from(await response.arrayBuffer());
+  if (!contentType.includes("spreadsheet") && buffer.slice(0, 20).toString().includes("<")) {
+    throw new Error("Spreadsheet tidak bisa diakses publik. Ubah akses Google Sheets menjadi Anyone with the link / Viewer.");
+  }
+  return loadSpreadsheetBuffer(buffer, `Google Sheets (${info.id})`);
+}
+
+async function processSpreadsheetUpload(sock, from, msg, caption = "") {
+  const document = msg.message?.documentMessage || msg.message?.documentWithCaptionMessage?.message?.documentMessage;
+  if (!document) return false;
+
+  const isGroup = from.endsWith("@g.us");
+  const allowedCaption = !isGroup || containsBotTrigger(caption) || /^\s*\/excel\b/i.test(caption);
+  if (!allowedCaption) return false;
+
+  const filename = document.fileName || "spreadsheet";
+  const mime = document.mimetype || "application/octet-stream";
+  const lower = filename.toLowerCase();
+  const isSpreadsheet = /\.(xlsx|xls|csv)$/i.test(lower) || /spreadsheet|excel|csv/i.test(mime);
+  if (!isSpreadsheet) return false;
+
+  try {
+    await sock.sendMessage(from, { text: `📊 Marley sedang membaca *${filename}*...` });
+    const buffer = await downloadMediaMessage(msg, "buffer", {});
+    const session = await loadSpreadsheetBuffer(buffer, filename);
+    spreadsheetSessions.set(from, session);
+    await sock.sendMessage(from, { text: `✅ Spreadsheet berhasil dibaca.\n\n${listSpreadsheetStatus(session)}\n\nCoba: *Marley, analisa repayment* atau */grafik payment point*` });
+  } catch (err) {
+    console.error("Spreadsheet upload error:", err);
+    await sock.sendMessage(from, { text: `❌ Marley gagal membaca spreadsheet.\n${err.message}` });
+  }
+  return true;
+}
+
+async function answerSpreadsheetQuestion(sock, from, question) {
+  const session = spreadsheetSessions.get(from);
+  if (!session) {
+    await sock.sendMessage(from, { text: "Belum ada spreadsheet yang dimuat di percakapan ini. Kirim Excel/CSV atau link Google Sheets terlebih dahulu." });
+    return;
+  }
+  const sheet = activeSheetFor(session);
+  const q = question.toLowerCase();
+  const summary = summarizeSheet(sheet);
+
+  if (/^(sheet|sheets|data|excel|spreadsheet)\b/.test(q) || q.includes("isi file")) {
+    await sock.sendMessage(from, { text: listSpreadsheetStatus(session) + `\n\nDeteksi kolom penting:\n${Object.entries(summary.detected).filter(([,v])=>v).map(([k,v])=>`• ${k}: ${v}`).join("\n")}` });
+    return;
+  }
+
+  if (q.includes("repayment")) {
+    const all = repaymentSummary(sheet);
+    if (!all) { await sock.sendMessage(from, { text: "Kolom yang diperlukan untuk menghitung repayment tidak ditemukan di sheet aktif." }); return; }
+    const pointMatch = q.match(/(?:point|branch)\s+([a-z0-9 _-]+)/i);
+    const point = pointMatch ? pointMatch[1].trim().replace(/[?.!,]+$/g, "") : null;
+    const result = point && sheet.detected.point ? repaymentSummary(sheet, point) : all;
+    await sock.sendMessage(from, { text: `📈 *ANALISA REPAYMENT*\n${point ? `Point: ${point}\n` : "Area: seluruh data\n"}\nLoan DPD 0: ${formatCompactNumber(result.current)}\nPayment ≥1x: ${formatCompactNumber(result.paid)}\nRepayment: ${formatPct(result.repayment)}\nTotal Payment: Rp ${formatCompactNumber(result.paidAmount)}\nOS New: Rp ${formatCompactNumber(result.os)}` });
+    return;
+  }
+
+  if (q.includes("point mana") || q.includes("per point") || q.includes("ranking")) {
+    const metric = q.includes("tunggakan") || q.includes("arrears") ? "arrears" : q.includes("os") ? "os" : q.includes("jumlah") || q.includes("loan") ? "rows" : "payment";
+    const top = topPointsByMetric(sheet, metric);
+    if (!top.length) { await sock.sendMessage(from, { text: "Kolom point/branch tidak ditemukan." }); return; }
+    const lines = top.map(([p,v],i)=>`${i+1}. ${p}: ${metric === "rows" ? formatCompactNumber(v)+" loan" : "Rp "+formatCompactNumber(v)}`);
+    await sock.sendMessage(from, { text: `🏆 *RANKING PER POINT — ${metric.toUpperCase()}*\n\n${lines.join("\n")}` });
+    return;
+  }
+
+  const sample = sheet.rows.slice(0, 80).map(r => Object.fromEntries(sheet.columns.slice(0, 18).map(c=>[c,r[c]])));
+  const prompt = `Kamu adalah Marley, analis data operasional Amartha. Jawab pertanyaan berdasarkan spreadsheet berikut. Jangan mengarang angka yang tidak ada. Jika data tidak cukup, katakan data apa yang kurang.\n\nSumber: ${session.sourceName}\nSheet: ${sheet.name}\nBaris: ${sheet.rowCount}\nKolom: ${sheet.columns.join(", ")}\nSample 80 baris pertama:\n${JSON.stringify(sample)}\n\nPertanyaan: ${question}`;
+  const result = await askGemini(prompt, "Gunakan hanya data spreadsheet dan konteks KPI yang tersedia.");
+  await sock.sendMessage(from, { text: result });
+}
+
+async function processSpreadsheetLink(sock, from, text) {
+  const urlMatch = String(text).match(/https?:\/\/docs\.google\.com\/spreadsheets\/d\/[^\s>]+/i);
+  if (!urlMatch) return false;
+  const isGroup = from.endsWith("@g.us");
+  if (isGroup && !containsBotTrigger(text)) return false;
+  try {
+    await sock.sendMessage(from, { text: "🔗 Marley sedang membaca Google Sheets..." });
+    const session = await loadPublicGoogleSheet(urlMatch[0]);
+    spreadsheetSessions.set(from, session);
+    await sock.sendMessage(from, { text: `✅ Google Sheets berhasil dimuat.\n\n${listSpreadsheetStatus(session)}` });
+  } catch (err) {
+    await sock.sendMessage(from, { text: `❌ Tidak bisa membaca Google Sheets.\n${err.message}\n\nJika sheet private, upload Excel-nya ke WhatsApp atau buat akses Viewer via link.` });
+  }
+  return true;
+}
+
+async function processSpreadsheetCommand(sock, from, command) {
+  const session = spreadsheetSessions.get(from);
+  if (command === "/data" || command === "/sheet") {
+    await sock.sendMessage(from, { text: listSpreadsheetStatus(session) });
+    return true;
+  }
+  if (command === "/grafik") {
+    if (!session) { await sock.sendMessage(from, { text: "Belum ada spreadsheet yang dimuat." }); return true; }
+    const sheet = activeSheetFor(session);
+    const top = topPointsByMetric(sheet, "payment").slice(0, 8);
+    if (!top.length) { await sock.sendMessage(from, { text: "Belum ditemukan kolom point dan payment untuk dibuat grafik." }); return true; }
+    const labels = top.map(x=>x[0]);
+    const values = top.map(x=>x[1]);
+    const image = await makeChartBuffer(`Top Point berdasarkan Total Payment — ${sheet.name}`, labels, values, "");
+    await sock.sendMessage(from, { image, caption: "📊 Grafik payment per point dari spreadsheet Marley." });
+    return true;
+  }
+  if (command.startsWith("/grafik ")) {
+    if (!session) { await sock.sendMessage(from, { text: "Belum ada spreadsheet yang dimuat." }); return true; }
+    const sheet = activeSheetFor(session);
+    const arg = command.slice(8).trim();
+    const metric = arg.includes("tunggakan") ? "arrears" : arg.includes("os") ? "os" : "payment";
+    const top = topPointsByMetric(sheet, metric).slice(0, 8);
+    if (!top.length) { await sock.sendMessage(from, { text: "Data untuk grafik tidak ditemukan." }); return true; }
+    const image = await makeChartBuffer(`Top Point — ${metric.toUpperCase()}`, top.map(x=>x[0]), top.map(x=>x[1]));
+    await sock.sendMessage(from, { image, caption: `📊 Grafik ${metric} per point.` });
+    return true;
+  }
+  return false;
+}
+
 // ======================================================
 // IDENTITAS BOT
 // ======================================================
@@ -1201,7 +1548,19 @@ async function startBot() {
       const text =
         msg.message.conversation ||
         msg.message.extendedTextMessage?.text ||
+        msg.message.documentMessage?.caption ||
+        msg.message.documentWithCaptionMessage?.message?.documentMessage?.caption ||
         "";
+
+      // Spreadsheet / CSV / Google Sheets engine.
+      try {
+        const handledFile = await processSpreadsheetUpload(sock, from, msg, text);
+        if (handledFile) return;
+        const handledLink = await processSpreadsheetLink(sock, from, text);
+        if (handledLink) return;
+      } catch (spreadsheetErr) {
+        console.error("Spreadsheet engine error:", spreadsheetErr);
+      }
 
       const mentionedJids =
         msg.message.extendedTextMessage?.contextInfo
@@ -1423,7 +1782,9 @@ async function startBot() {
         const command =
           text.trim().toLowerCase();
 
-        if (command === "/rangkum") {
+        if (await processSpreadsheetCommand(sock, from, command)) {
+          return;
+        } else if (command === "/rangkum") {
           await sock.sendMessage(from, {
             text:
               "Sedang merangkum, tunggu sebentar...",
@@ -1579,6 +1940,9 @@ async function startBot() {
               "/rangkum - merangkum diskusi grup\n" +
               "/analisa - analisis masalah + saran action plan\n" +
               "/proyeksi - hitung proyeksi dari data di chat\n" +
+              "/data - status spreadsheet yang sedang dimuat\n" +
+              "/grafik - buat grafik payment per point\n" +
+              "/grafik tunggakan - grafik tunggakan per point\n" +
               "/statusclosing - status report closing hari ini\n" +
               "/rekapclosing - rekap closing area hari ini\n" +
               "/rekapclosing YYYY-MM-DD - rekap tanggal tertentu\n" +
@@ -1590,6 +1954,9 @@ async function startBot() {
               "Marley lupakan: ... - hapus memory\n\n" +
               'Atau sebut nama saya "Marley" diikuti pertanyaan apa saja.',
           });
+        } else if (spreadsheetSessions.has(from) && (!isGroup || isMentioned) && /repayment|spreadsheet|excel|point mana|ranking|tunggakan|data file|file ini|grafik|loan|payment/i.test(stripMentions(text))) {
+          await answerSpreadsheetQuestion(sock, from, stripMentions(text));
+          return;
         } else if (isGroup && isMentioned) {
           const question =
             stripMentions(text);
