@@ -418,6 +418,406 @@ async function askGeminiWithImage(
   }
 }
 
+
+// ======================================================
+// SMART DAILY REPORT TRACKER MARLEY V3
+// ======================================================
+
+const REPORT_DATA_DIR = path.join(__dirname, "data");
+const REPORT_DATA_FILE = path.join(REPORT_DATA_DIR, "daily_reports.json");
+const REPORT_POINTS = String(
+  process.env.REPORT_POINTS || "Sepulu,Kwanyar,Arosbaya,Blega,Kamal,Burneh"
+)
+  .split(",")
+  .map((x) => x.trim())
+  .filter(Boolean);
+
+let dailyReports = {};
+let reportWriteQueue = Promise.resolve();
+
+function normalizePointName(value) {
+  const raw = String(value || "")
+    .replace(/[\*_`]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  const key = normalizeForSearch(raw);
+  const aliases = {
+    sepulu: "Sepulu",
+    kwanyar: "Kwanyar",
+    arosbaya: "Arosbaya",
+    blega: "Blega",
+    kamal: "Kamal",
+    burneh: "Burneh",
+  };
+
+  return aliases[key] || raw.replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+function parseReportDate(text) {
+  const clean = String(text || "").replace(/\*/g, "");
+  const match = clean.match(
+    /\b(\d{1,2})\s+(Januari|Februari|Maret|April|Mei|Juni|Juli|Agustus|September|Oktober|November|Desember)\s+(\d{4})\b/i
+  );
+
+  if (!match) {
+    const numeric = clean.match(/\b(\d{1,2})[\s/-]+(\d{1,2})[\s/-]+(\d{4})\b/);
+    if (!numeric) return null;
+    const day = numeric[1].padStart(2, "0");
+    const month = numeric[2].padStart(2, "0");
+    return `${numeric[3]}-${month}-${day}`;
+  }
+
+  const months = {
+    januari: "01", februari: "02", maret: "03", april: "04",
+    mei: "05", juni: "06", juli: "07", agustus: "08",
+    september: "09", oktober: "10", november: "11", desember: "12",
+  };
+
+  const day = match[1].padStart(2, "0");
+  const month = months[match[2].toLowerCase()];
+  return `${match[3]}-${month}-${day}`;
+}
+
+function parseFlexibleNumber(value) {
+  if (value === undefined || value === null) return null;
+
+  let raw = String(value)
+    .trim()
+    .replace(/[\*_`]/g, "")
+    .replace(/\s+/g, "");
+
+  if (!raw || raw === "-" || raw === "/") return null;
+
+  const lower = raw.toLowerCase();
+  let multiplier = 1;
+  if (lower.endsWith("jt")) {
+    multiplier = 1_000_000;
+    raw = raw.slice(0, -2);
+  } else if (lower.endsWith("juta")) {
+    multiplier = 1_000_000;
+    raw = raw.slice(0, -4);
+  } else if (lower.endsWith("rb")) {
+    multiplier = 1_000;
+    raw = raw.slice(0, -2);
+  }
+
+  raw = raw.replace(/rp/gi, "");
+  if (!raw) return null;
+
+  if (raw.includes(".") && raw.includes(",")) {
+    raw = raw.replace(/\./g, "").replace(",", ".");
+  } else if (raw.includes(",")) {
+    const commaParts = raw.split(",");
+    if (commaParts.length === 2 && commaParts[1].length <= 2) {
+      raw = commaParts[0].replace(/\./g, "") + "." + commaParts[1];
+    } else {
+      raw = raw.replace(/,/g, "");
+    }
+  } else if (raw.includes(".")) {
+    const dotParts = raw.split(".");
+    const looksLikeThousands = dotParts.length > 1 && dotParts.slice(1).every((x) => x.length === 3);
+    if (looksLikeThousands) raw = raw.replace(/\./g, "");
+  }
+
+  const n = Number(raw);
+  return Number.isFinite(n) ? n * multiplier : null;
+}
+
+function parseCountAmount(value) {
+  let raw = String(value || "")
+    .replace(/[\*_`]/g, "")
+    .trim();
+
+  if (!raw || raw === "-" || raw === "/") {
+    return { count: null, amount: null };
+  }
+
+  raw = raw.replace(/^:\s*/, "");
+  const slash = raw.indexOf("/");
+
+  if (slash >= 0) {
+    const left = raw.slice(0, slash).trim();
+    const right = raw.slice(slash + 1).trim();
+    return {
+      count: parseFlexibleNumber(left),
+      amount: parseFlexibleNumber(right),
+    };
+  }
+
+  return {
+    count: null,
+    amount: parseFlexibleNumber(raw),
+  };
+}
+
+function findReportValue(text, labels) {
+  const lines = String(text || "").split(/\r?\n/);
+  for (const label of labels) {
+    const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const regex = new RegExp(`^\\s*${escaped}\\s*:?\\s*(.*?)\\s*$`, "i");
+    const line = lines.find((x) => regex.test(x.replace(/[\*_]/g, "")));
+    if (line) {
+      const cleaned = line.replace(/[\*_]/g, "");
+      const match = cleaned.match(regex);
+      return match ? match[1].trim() : "";
+    }
+  }
+  return "";
+}
+
+function parseDailyReport(text) {
+  const raw = String(text || "");
+  if (!/REPORT\s+CLOSING\s+HARIAN/i.test(raw)) return null;
+
+  const pointMatch = raw.match(/(?:Point|Nama point)\s+([^\r\n*]+)/i);
+  if (!pointMatch) return null;
+
+  const point = normalizePointName(pointMatch[1]);
+  const date = parseReportDate(raw);
+  if (!date) return null;
+
+  const flow0 = parseCountAmount(findReportValue(raw, ["Flow 0+"]));
+  const flow30 = parseCountAmount(findReportValue(raw, ["Flow 30+"]));
+  const flow60 = parseCountAmount(findReportValue(raw, ["Flow 60+"]));
+  const flow90 = parseCountAmount(findReportValue(raw, ["Flow 90+"]));
+
+  const rf130 = parseCountAmount(findReportValue(raw, ["1-30"]));
+  const rf3060 = parseCountAmount(findReportValue(raw, ["30-60"]));
+  const rf6090 = parseCountAmount(findReportValue(raw, ["60-90"]));
+  const rf90 = parseCountAmount(findReportValue(raw, ["90+"]));
+  const btc = parseCountAmount(findReportValue(raw, ["BTC"]));
+
+  const approval = parseCountAmount(findReportValue(raw, ["Total Apprval", "Total Approval"]));
+  const sosBaru = parseFlexibleNumber(findReportValue(raw, ["Sos baru"]));
+  const fupSos = parseFlexibleNumber(findReportValue(raw, ["FUP SOS by wa", "FUP SOS by WA"]));
+  const totalMajelis = parseFlexibleNumber(findReportValue(raw, ["Total majelis"]));
+  const ppob = parseFlexibleNumber(findReportValue(raw, ["PPOB"]));
+  const celengan = parseFlexibleNumber(findReportValue(raw, ["Celengan"]));
+  const rebutan = parseFlexibleNumber(findReportValue(raw, ["Rebutan"]));
+
+  return {
+    point,
+    date,
+    receivedAt: new Date().toISOString(),
+    collection: { flow0, flow30, flow60, flow90 },
+    rf: { btc, oneTo30: rf130, thirtyTo60: rf3060, sixtyTo90: rf6090, ninetyPlus: rf90 },
+    disburse: { approval, sosBaru, fupSos },
+    pemilihanKM: { totalMajelis },
+    crossSelling: { ppob, celengan, rebutan },
+  };
+}
+
+async function initDailyReports() {
+  try {
+    await fs.mkdir(REPORT_DATA_DIR, { recursive: true });
+    try {
+      const raw = await fs.readFile(REPORT_DATA_FILE, "utf8");
+      const parsed = JSON.parse(raw);
+      dailyReports = parsed && typeof parsed === "object" ? parsed : {};
+    } catch {
+      dailyReports = {};
+      await saveDailyReports();
+    }
+    console.log(`Daily Report Tracker siap: ${Object.keys(dailyReports).length} tanggal.`);
+  } catch (err) {
+    console.error("Gagal menyiapkan Daily Report Tracker:", err);
+    dailyReports = {};
+  }
+}
+
+function saveDailyReports() {
+  const payload = JSON.stringify(dailyReports, null, 2);
+  reportWriteQueue = reportWriteQueue
+    .catch(() => {})
+    .then(() => fs.writeFile(REPORT_DATA_FILE, payload, "utf8"));
+  return reportWriteQueue;
+}
+
+function addDailyReport(report) {
+  if (!dailyReports[report.date]) dailyReports[report.date] = {};
+  dailyReports[report.date][report.point] = report;
+  return saveDailyReports();
+}
+
+function getReportsForDate(date) {
+  return dailyReports[date] || {};
+}
+
+function getReportProgress(date) {
+  const reports = getReportsForDate(date);
+  const completed = REPORT_POINTS.filter((point) => reports[point]);
+  return {
+    completed,
+    missing: REPORT_POINTS.filter((point) => !reports[point]),
+    total: REPORT_POINTS.length,
+  };
+}
+
+function formatDisplayDate(dateKey) {
+  const [year, month, day] = String(dateKey || "").split("-");
+  if (!year || !month || !day) return dateKey;
+  const months = [
+    "Januari", "Februari", "Maret", "April", "Mei", "Juni",
+    "Juli", "Agustus", "September", "Oktober", "November", "Desember",
+  ];
+  const monthName = months[Number(month) - 1];
+  return monthName ? `${Number(day)} ${monthName} ${year}` : dateKey;
+}
+
+function formatNumber(value) {
+  if (value === null || value === undefined || !Number.isFinite(Number(value))) return "";
+  return Number(value).toLocaleString("id-ID", { maximumFractionDigits: 2 });
+}
+
+function sumMetric(reports, getter) {
+  let total = 0;
+  let hasValue = false;
+  for (const report of Object.values(reports)) {
+    const value = getter(report);
+    if (value !== null && value !== undefined && Number.isFinite(Number(value))) {
+      total += Number(value);
+      hasValue = true;
+    }
+  }
+  return hasValue ? total : null;
+}
+
+function aggregateDailyReports(date) {
+  const reports = getReportsForDate(date);
+  const points = Object.values(reports);
+  if (!points.length) return null;
+
+  const aggregate = {
+    collection: {},
+    rf: {},
+    disburse: {},
+    pemilihanKM: {},
+    crossSelling: {},
+  };
+
+  for (const key of ["flow0", "flow30", "flow60", "flow90"]) {
+    aggregate.collection[key] = {
+      count: sumMetric(reports, (r) => r.collection[key].count),
+      amount: sumMetric(reports, (r) => r.collection[key].amount),
+    };
+  }
+
+  for (const key of ["btc", "oneTo30", "thirtyTo60", "sixtyTo90", "ninetyPlus"]) {
+    aggregate.rf[key] = {
+      count: sumMetric(reports, (r) => r.rf[key].count),
+      amount: sumMetric(reports, (r) => r.rf[key].amount),
+    };
+  }
+
+  aggregate.disburse.approval = {
+    count: sumMetric(reports, (r) => r.disburse.approval.count),
+    amount: sumMetric(reports, (r) => r.disburse.approval.amount),
+  };
+  aggregate.disburse.sosBaru = sumMetric(reports, (r) => r.disburse.sosBaru);
+  aggregate.disburse.fupSos = sumMetric(reports, (r) => r.disburse.fupSos);
+  aggregate.pemilihanKM.totalMajelis = sumMetric(reports, (r) => r.pemilihanKM.totalMajelis);
+  aggregate.crossSelling.ppob = sumMetric(reports, (r) => r.crossSelling.ppob);
+  aggregate.crossSelling.celengan = sumMetric(reports, (r) => r.crossSelling.celengan);
+  aggregate.crossSelling.rebutan = sumMetric(reports, (r) => r.crossSelling.rebutan);
+
+  return aggregate;
+}
+
+function formatCountAmount(metric) {
+  if (!metric) return "";
+  if (metric.count !== null && metric.amount !== null) {
+    return `${formatNumber(metric.count)} / ${formatNumber(metric.amount)}`;
+  }
+  if (metric.count !== null) return formatNumber(metric.count);
+  if (metric.amount !== null) return formatNumber(metric.amount);
+  return "";
+}
+
+function formatDailyAreaReport(date) {
+  const progress = getReportProgress(date);
+  const aggregate = aggregateDailyReports(date);
+  if (!aggregate) return "Belum ada report untuk tanggal tersebut.";
+
+  const a = aggregate;
+  return (
+    `*REPORT CLOSING HARIAN*\n` +
+    `*AREA BANGKALAN*\n` +
+    `${formatDisplayDate(date)}\n\n` +
+    `Collection\n` +
+    `Flow 0+    : ${formatCountAmount(a.collection.flow0)}\n` +
+    `Flow 30+ : ${formatCountAmount(a.collection.flow30)}\n` +
+    `Flow 60+ : ${formatCountAmount(a.collection.flow60)}\n` +
+    `Flow 90+ : ${formatCountAmount(a.collection.flow90)}\n\n\n` +
+    `RF Amcoll (1x angsuran)\n` +
+    `BTC = ${formatCountAmount(a.rf.btc)}\n` +
+    `1-30   : ${formatCountAmount(a.rf.oneTo30)}\n` +
+    `30-60 : ${formatCountAmount(a.rf.thirtyTo60)}\n` +
+    `60-90 : ${formatCountAmount(a.rf.sixtyTo90)}\n` +
+    `90+    : ${formatCountAmount(a.rf.ninetyPlus)}\n\n` +
+    `Disburse\n` +
+    `Total Apprval: ${formatCountAmount(a.disburse.approval)}\n` +
+    `Sos baru : ${formatNumber(a.disburse.sosBaru)}\n` +
+    `FUP SOS by wa : ${formatNumber(a.disburse.fupSos)}\n\n` +
+    `Pemilihan KM\n` +
+    `Total majelis : ${formatNumber(a.pemilihanKM.totalMajelis)}\n\n` +
+    `Cross Selling\n` +
+    `PPOB : ${formatNumber(a.crossSelling.ppob)}\n` +
+    `Celengan : ${formatNumber(a.crossSelling.celengan)}\n` +
+    `Rebutan: ${formatNumber(a.crossSelling.rebutan)}\n\n` +
+    `Progress report: ${progress.completed.length}/${progress.total} point`
+  );
+}
+
+function formatReportStatus(date) {
+  const progress = getReportProgress(date);
+  const lines = REPORT_POINTS.map((point) =>
+    progress.completed.includes(point) ? `✅ ${point}` : `❌ ${point}`
+  );
+  return (
+    `📊 *STATUS REPORT CLOSING*\n` +
+    `${formatDisplayDate(date)}\n\n` +
+    lines.join("\n") +
+    `\n\nProgress: ${progress.completed.length}/${progress.total}`
+  );
+}
+
+async function processIncomingDailyReport(sock, from, sender, text) {
+  const report = parseDailyReport(text);
+  if (!report) return false;
+
+  report.sender = sender || "unknown";
+  await addDailyReport(report);
+
+  const progress = getReportProgress(report.date);
+  await sock.sendMessage(from, {
+    text:
+      `✅ Report Closing diterima\n\n` +
+      `Point: ${report.point}\n` +
+      `Tanggal: ${report.date}\n` +
+      `Progress: ${progress.completed.length}/${progress.total}`,
+  });
+
+  if (progress.missing.length) {
+    console.log(`Report ${report.point} diterima dari ${sender}. Missing: ${progress.missing.join(", ")}`);
+  }
+
+  if (progress.missing.length === 0) {
+    const key = `closing-complete:${report.date}:${from}`;
+    if (!sentClosingKeys.has(key)) {
+      sentClosingKeys.add(key);
+      await sock.sendMessage(from, {
+        text:
+          `🎯 *REPORT AREA LENGKAP*\n\n` +
+          `Semua ${progress.total} point sudah mengirim Report Closing ${report.date}.\n\n` +
+          formatDailyAreaReport(report.date),
+      });
+    }
+  }
+
+  return true;
+}
+
 // ======================================================
 // IDENTITAS BOT
 // ======================================================
@@ -479,6 +879,7 @@ const DAILY_REMINDERS = [
 
 const quietGroupState = new Map();
 const sentReminderKeys = new Set();
+const sentClosingKeys = new Set();
 let reminderTimer = null;
 let reminderSocket = null;
 
@@ -914,6 +1315,16 @@ async function startBot() {
 
       if (isGroup) {
         addToHistory(from, sender, text);
+
+        // Report Closing Harian diproses otomatis sebelum command/AI.
+        if (text && /REPORT\s+CLOSING\s+HARIAN/i.test(text)) {
+          try {
+            const handled = await processIncomingDailyReport(sock, from, sender, text);
+            if (handled) return;
+          } catch (reportErr) {
+            console.error("Error saat parsing Report Closing:", reportErr);
+          }
+        }
       }
 
       try {
@@ -1090,6 +1501,28 @@ async function startBot() {
           await sock.sendMessage(from, {
             text: result,
           });
+        } else if (command === "/statusclosing") {
+          const now = getJakartaNow();
+          const date = getDateKey(now);
+          await sock.sendMessage(from, { text: formatReportStatus(date) });
+        } else if (command === "/rekapclosing") {
+          const now = getJakartaNow();
+          const date = getDateKey(now);
+          await sock.sendMessage(from, { text: formatDailyAreaReport(date) });
+        } else if (command.startsWith("/rekapclosing ")) {
+          const requestedDate = command.slice("/rekapclosing ".length).trim();
+          const valid = /^\d{4}-\d{2}-\d{2}$/.test(requestedDate);
+          if (!valid) {
+            await sock.sendMessage(from, {
+              text: "Format tanggal: /rekapclosing YYYY-MM-DD",
+            });
+            return;
+          }
+          await sock.sendMessage(from, { text: formatDailyAreaReport(requestedDate) });
+        } else if (command === "/statusclosing ") {
+          const now = getJakartaNow();
+          const date = getDateKey(now);
+          await sock.sendMessage(from, { text: formatReportStatus(date) });
         } else if (command === "/reminderid") {
           if (!isGroup) {
             await sock.sendMessage(from, {
@@ -1146,6 +1579,9 @@ async function startBot() {
               "/rangkum - merangkum diskusi grup\n" +
               "/analisa - analisis masalah + saran action plan\n" +
               "/proyeksi - hitung proyeksi dari data di chat\n" +
+              "/statusclosing - status report closing hari ini\n" +
+              "/rekapclosing - rekap closing area hari ini\n" +
+              "/rekapclosing YYYY-MM-DD - rekap tanggal tertentu\n" +
               "/help - tampilkan menu ini\n\n" +
               "Memory Marley:\n" +
               "Marley ingat: ... - simpan memory\n" +
@@ -1258,4 +1694,5 @@ app.listen(PORT, () => {
 });
 
 await initMemory();
+await initDailyReports();
 await startBot();
