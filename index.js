@@ -153,14 +153,29 @@ async function startBot() {
     // Cek kalau pesan ini gambar (dengan atau tanpa caption)
     const imageMessage = msg.message.imageMessage;
     if (imageMessage) {
+      const caption = imageMessage.caption || "";
+
+      // Cek mention juga untuk gambar (pakai data teknis WA + fallback nama)
+      const imgMentionedJids =
+        imageMessage.contextInfo?.mentionedJid || [];
+      const imageIsMentioned =
+        (botJid && imgMentionedJids.some((jid) => jid.split("@")[0] === botJid)) ||
+        (isGroup && startsWithBotMention(caption));
+
+      // Di grup: cuma proses kalau bot di-mention di caption-nya
+      // Di chat pribadi: selalu proses
+      if (isGroup && !imageIsMentioned) {
+        return;
+      }
+
       try {
         const buffer = await downloadMediaMessage(msg, "buffer", {});
         const imageBase64 = buffer.toString("base64");
         const mimeType = imageMessage.mimetype || "image/jpeg";
-        const caption = imageMessage.caption || "";
+        const cleanCaption = isGroup ? stripMentions(caption) : caption;
 
         await sock.sendMessage(from, { text: "Sedang menganalisis gambar, tunggu sebentar..." });
-        const result = await askGeminiWithImage(caption, imageBase64, mimeType);
+        const result = await askGeminiWithImage(cleanCaption, imageBase64, mimeType);
         await sock.sendMessage(from, { text: result });
       } catch (err) {
         console.error("Error saat proses gambar:", err);
