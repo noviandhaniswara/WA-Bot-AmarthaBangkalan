@@ -422,6 +422,274 @@ async function askGeminiWithImage(
 // IDENTITAS BOT
 // ======================================================
 
+
+
+// ======================================================
+// REMINDER ENGINE MARLEY V2
+// ======================================================
+
+const REMINDER_TIMEZONE = process.env.TIMEZONE || "Asia/Jakarta";
+const QUIET_GROUP_MINUTES = Number(process.env.QUIET_GROUP_MINUTES || 120);
+const QUIET_CHECK_START = process.env.QUIET_CHECK_START || "08:00";
+const QUIET_CHECK_END = process.env.QUIET_CHECK_END || "21:00";
+const QUIET_REMINDER_COOLDOWN = Number(
+  process.env.QUIET_REMINDER_COOLDOWN || 120
+);
+
+// Isi REMINDER_GROUPS dengan JID grup yang boleh menerima reminder.
+// Contoh: 120363012345678901@g.us,120363098765432109@g.us
+// Kosong = reminder otomatis tidak dikirim ke grup mana pun.
+const REMINDER_GROUPS = new Set(
+  String(process.env.REMINDER_GROUPS || "")
+    .split(",")
+    .map((x) => x.trim())
+    .filter(Boolean)
+);
+
+const DAILY_REMINDERS = [
+  {
+    id: "08",
+    time: process.env.REMINDER_08 || "08:00",
+    text:
+      "Ayo Briefing yang bener, disusun dengan baik Plan Penagihan dan Proyeksi Disbursenya, Semangat guys",
+  },
+  {
+    id: "12",
+    time: process.env.REMINDER_12 || "12:00",
+    text: "Ayo ayo halfday, Cek strategi, apa sudah berjalan",
+  },
+  {
+    id: "15",
+    time: process.env.REMINDER_15 || "15:00",
+    text: "gimana ada kendala di lapang ?",
+  },
+  {
+    id: "19",
+    time: process.env.REMINDER_19 || "19:00",
+    text:
+      "Cek HV, SOS, FORM KM, Upload Call/Visit, Tugas Modal, Mikronova dan Segera Report",
+  },
+  {
+    id: "21",
+    time: process.env.REMINDER_21 || "21:00",
+    text:
+      "Selamat istirahat, Terimakasih untuk kerja kerasnya hari ini tim, Kita gas lagi besok.",
+  },
+];
+
+const quietGroupState = new Map();
+const sentReminderKeys = new Set();
+let reminderTimer = null;
+let reminderSocket = null;
+
+function isReminderGroup(groupId) {
+  return Boolean(groupId) && REMINDER_GROUPS.has(groupId);
+}
+
+function parseHHMM(value) {
+  const match = String(value || "").match(/^(\d{2}):(\d{2})$/);
+  if (!match) return null;
+
+  const hour = Number(match[1]);
+  const minute = Number(match[2]);
+
+  if (hour > 23 || minute > 59) return null;
+  return { hour, minute };
+}
+
+function getJakartaNow() {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: REMINDER_TIMEZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+    weekday: "short",
+  }).formatToParts(new Date());
+
+  const get = (type) => parts.find((p) => p.type === type)?.value;
+
+  return {
+    year: get("year"),
+    month: get("month"),
+    day: get("day"),
+    hour: Number(get("hour")),
+    minute: Number(get("minute")),
+    second: Number(get("second")),
+    weekday: get("weekday"),
+  };
+}
+
+function getDateKey(now) {
+  return `${now.year}-${now.month}-${now.day}`;
+}
+
+function isWithinTimeWindow(hour, minute, start, end) {
+  const startParts = parseHHMM(start);
+  const endParts = parseHHMM(end);
+  if (!startParts || !endParts) return false;
+
+  const current = hour * 60 + minute;
+  const startValue = startParts.hour * 60 + startParts.minute;
+  const endValue = endParts.hour * 60 + endParts.minute;
+
+  if (startValue <= endValue) {
+    return current >= startValue && current <= endValue;
+  }
+
+  return current >= startValue || current <= endValue;
+}
+
+function cleanupSentReminderKeys(currentDateKey) {
+  for (const key of sentReminderKeys) {
+    if (!key.startsWith(currentDateKey + ":")) {
+      sentReminderKeys.delete(key);
+    }
+  }
+}
+
+async function sendReminderToConfiguredGroups(text) {
+  if (!reminderSocket) return;
+
+  if (REMINDER_GROUPS.size === 0) {
+    console.warn(
+      "Reminder Marley belum aktif: REMINDER_GROUPS belum diisi."
+    );
+    return;
+  }
+
+  for (const groupId of REMINDER_GROUPS) {
+    try {
+      await reminderSocket.sendMessage(groupId, { text });
+      console.log(`Reminder Marley terkirim ke ${groupId}`);
+    } catch (err) {
+      console.error(
+        `Gagal mengirim reminder ke ${groupId}:`,
+        err?.message || err
+      );
+    }
+  }
+}
+
+async function processScheduledReminders(now) {
+  const dateKey = getDateKey(now);
+  cleanupSentReminderKeys(dateKey);
+
+  for (const reminder of DAILY_REMINDERS) {
+    const time = parseHHMM(reminder.time);
+    if (!time) {
+      console.warn(`Format waktu reminder tidak valid: ${reminder.time}`);
+      continue;
+    }
+
+    if (now.hour !== time.hour || now.minute !== time.minute) continue;
+
+    const key = `${dateKey}:${reminder.id}`;
+    if (sentReminderKeys.has(key)) continue;
+
+    sentReminderKeys.add(key);
+    await sendReminderToConfiguredGroups(`📢 ${reminder.text}`);
+  }
+}
+
+async function processQuietGroups(now) {
+  if (
+    !isWithinTimeWindow(
+      now.hour,
+      now.minute,
+      QUIET_CHECK_START,
+      QUIET_CHECK_END
+    )
+  ) {
+    return;
+  }
+
+  if (!reminderSocket || REMINDER_GROUPS.size === 0) return;
+
+  const nowMs = Date.now();
+  const quietMs = QUIET_GROUP_MINUTES * 60 * 1000;
+  const cooldownMs = QUIET_REMINDER_COOLDOWN * 60 * 1000;
+
+  for (const groupId of REMINDER_GROUPS) {
+    const state = quietGroupState.get(groupId);
+    if (!state?.lastActivity) continue;
+
+    const inactiveMs = nowMs - state.lastActivity;
+    if (inactiveMs < quietMs) continue;
+
+    if (
+      state.lastQuietReminder &&
+      nowMs - state.lastQuietReminder < cooldownMs
+    ) {
+      continue;
+    }
+
+    const inactiveMinutes = Math.floor(inactiveMs / 60000);
+
+    try {
+      await reminderSocket.sendMessage(groupId, {
+        text:
+          `📢 WOI TEAM 😄\n\n` +
+          `Grup sudah sepi sekitar ${inactiveMinutes} menit.\n` +
+          `Jangan lupa update kegiatan lapang masing-masing ya.\n\n` +
+          `Kalau ada kendala, langsung sampaikan di grup supaya bisa kita bantu cari solusinya.\n\n` +
+          `Semangat team! 💪`,
+      });
+
+      state.lastQuietReminder = nowMs;
+      console.log(
+        `Quiet-group reminder terkirim ke ${groupId} setelah ${inactiveMinutes} menit.`
+      );
+    } catch (err) {
+      console.error(
+        `Gagal mengirim quiet-group reminder ke ${groupId}:`,
+        err?.message || err
+      );
+    }
+  }
+}
+
+function startReminderEngine(sock) {
+  reminderSocket = sock;
+
+  if (reminderTimer) return;
+
+  console.log("========================================");
+  console.log("REMINDER ENGINE MARLEY AKTIF");
+  console.log(`Timezone: ${REMINDER_TIMEZONE}`);
+  console.log(`Quiet group: ${QUIET_GROUP_MINUTES} menit`);
+  console.log(`Reminder groups: ${REMINDER_GROUPS.size}`);
+  console.log("========================================");
+
+  // Cek setiap 30 detik agar reminder tidak bergantung pada adanya pesan masuk.
+  reminderTimer = setInterval(async () => {
+    if (!reminderSocket) return;
+
+    try {
+      const now = getJakartaNow();
+      await processScheduledReminders(now);
+      await processQuietGroups(now);
+    } catch (err) {
+      console.error("Error Reminder Engine:", err);
+    }
+  }, 30 * 1000);
+}
+
+function trackGroupActivity(groupId) {
+  if (!groupId || !isReminderGroup(groupId)) return;
+
+  const current = quietGroupState.get(groupId) || {
+    lastActivity: null,
+    lastQuietReminder: null,
+  };
+
+  current.lastActivity = Date.now();
+  quietGroupState.set(groupId, current);
+}
+
 const BOT_NAME = "Marley";
 
 const triggerPattern = new RegExp(
@@ -464,7 +732,12 @@ async function startBot() {
     logger: pino({ level: "silent" }),
   });
 
+  // Socket terbaru dipakai oleh Reminder Engine, termasuk setelah reconnect.
+  reminderSocket = sock;
+
   sock.ev.on("creds.update", saveCreds);
+
+  startReminderEngine(sock);
 
   sock.ev.on("connection.update", (update) => {
     const { connection, qr, lastDisconnect } = update;
@@ -515,6 +788,9 @@ async function startBot() {
       if (!from) return;
 
       const isGroup = from.endsWith("@g.us");
+
+      // Aktivitas grup dipakai oleh Quiet Group Detection.
+      trackGroupActivity(from);
 
       const sender =
         msg.pushName ||
@@ -813,6 +1089,52 @@ async function startBot() {
 
           await sock.sendMessage(from, {
             text: result,
+          });
+        } else if (command === "/reminderid") {
+          if (!isGroup) {
+            await sock.sendMessage(from, {
+              text: "Perintah /reminderid hanya bisa digunakan di grup WhatsApp.",
+            });
+            return;
+          }
+
+          let subject = "Grup WhatsApp";
+          try {
+            const metadata = await sock.groupMetadata(from);
+            subject = metadata?.subject || subject;
+          } catch {
+            // Tidak masalah jika metadata grup gagal diambil.
+          }
+
+          await sock.sendMessage(from, {
+            text:
+              `Nama grup: ${subject}\n` +
+              `Group JID: ${from}\n\n` +
+              `Masukkan JID ini ke REMINDER_GROUPS di .env agar Marley mengirim reminder otomatis ke grup ini.`,
+          });
+        } else if (command === "/reminderstatus") {
+          if (!isGroup) {
+            await sock.sendMessage(from, {
+              text: "Perintah /reminderstatus hanya bisa digunakan di grup WhatsApp.",
+            });
+            return;
+          }
+
+          const state = quietGroupState.get(from);
+          const lastActivity = state?.lastActivity
+            ? new Date(state.lastActivity).toLocaleString("id-ID", {
+                timeZone: REMINDER_TIMEZONE,
+              })
+            : "belum tercatat";
+
+          const isConfigured = isReminderGroup(from);
+
+          await sock.sendMessage(from, {
+            text:
+              `🤖 STATUS REMINDER MARLEY\n\n` +
+              `Reminder grup: ${isConfigured ? "AKTIF" : "TIDAK AKTIF"}\n` +
+              `Batas grup sepi: ${QUIET_GROUP_MINUTES} menit\n` +
+              `Aktivitas terakhir: ${lastActivity}`,
           });
         } else if (
           command === "/help" ||
