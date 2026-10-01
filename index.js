@@ -898,6 +898,7 @@ function findColumn(columns, candidates) {
 
 function detectDatasetColumns(columns) {
   return {
+    area: findColumn(columns, ["area_name", "area", "regional_area", "region_area", "nama_area"]),
     point: findColumn(columns, ["branch_name", "point", "point_name", "branch"]),
     bp: findColumn(columns, ["bp_username", "agent_fullname", "bp_name", "bp"]),
     customer: findColumn(columns, ["customer_name", "customer", "mitra_name"]),
