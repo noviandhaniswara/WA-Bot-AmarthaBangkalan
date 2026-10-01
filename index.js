@@ -976,6 +976,7 @@ function detectDatasetColumns(columns) {
     installment: findColumn(columns, ["installment_amount"]),
     payment: findColumn(columns, ["total_payment"]),
     paymentMin1x: findColumn(columns, ["payment_min_1x", "total_payment_min_1x"]),
+    loanRestructured: findColumn(columns, ["is_loan_restructured"]),
     arrears: findColumn(columns, ["total_tunggakan"]),
     movement: findColumn(columns, ["movement_label"]),
     loanState: findColumn(columns, ["loan_state"]),
@@ -1187,9 +1188,12 @@ async function processSpreadsheetUpload(sock, from, msg, caption = "") {
   const document = msg.message?.documentMessage || msg.message?.documentWithCaptionMessage?.message?.documentMessage;
   if (!document) return false;
   const isGroup = from.endsWith("@g.us");
-  const allowedCaption = !isGroup || containsBotTrigger(caption) || /^\s*\/excel\b/i.test(caption);
-  if (!allowedCaption) return false;
   const filename = document.fileName || "spreadsheet";
+  const autoFileType = getAutoRepaymentFileType(filename);
+  // File Current / DPD 1-30 boleh diproses otomatis tanpa harus mengetik "Marley".
+  // File spreadsheet lain di grup tetap membutuhkan trigger agar Marley tidak terlalu banyak bicara.
+  const allowedCaption = !isGroup || containsBotTrigger(caption) || /^\s*\/excel\b/i.test(caption) || Boolean(autoFileType);
+  if (!allowedCaption) return false;
   const mime = document.mimetype || "application/octet-stream";
   if (!/\.(xlsx|xls|csv)$/i.test(filename) && !/spreadsheet|excel|csv/i.test(mime)) return false;
   if (isKpDailySourceName(filename) || /kp\s*daily/i.test(caption)) return processKpDailyUpload(sock, from, msg, caption);
@@ -1198,9 +1202,24 @@ async function processSpreadsheetUpload(sock, from, msg, caption = "") {
     const buffer = await downloadMediaMessage(msg, "buffer", {});
     const session = await loadSpreadsheetBuffer(buffer, filename);
     spreadsheetSessions.set(from, session);
+    const autoType = autoFileType || inferAutoRepaymentFileType(activeSheetFor(session));
     await persistSpreadsheetSession(from, buffer, filename);
     console.log(`[EXCEL SAVED] ${from} -> ${filename}`);
-    await sock.sendMessage(from, { text: `✅ Spreadsheet berhasil dibaca dan disimpan.\n\n${listSpreadsheetStatus(session)}\n\nMarley siap menganalisa *file ini saja*.\nContoh: *Marley, analisa repayment*` });
+
+    if (autoType) {
+      const sheet = activeSheetFor(session);
+      const areaFilter = sheet?.detected?.area ? "bangkalan" : null;
+      const analysis = buildAutoRepaymentAnalysis(sheet, autoType, areaFilter);
+      if (analysis) {
+        await sock.sendMessage(from, { text: analysis });
+      } else {
+        await sock.sendMessage(from, {
+          text: `⚠️ File *${filename}* sudah terbaca, tetapi kolom yang dibutuhkan untuk analisis otomatis belum ditemukan.\n\nMarley membutuhkan: Point, DPD Old, Payment Min 1x, dan is_loan_restructured.`
+        });
+      }
+    } else {
+      await sock.sendMessage(from, { text: `✅ Spreadsheet berhasil dibaca dan disimpan.\n\n${listSpreadsheetStatus(session)}\n\nMarley siap menganalisa *file ini saja*.` });
+    }
   } catch (err) {
     console.error("Spreadsheet upload error:", err);
     await sock.sendMessage(from, { text: `❌ Marley gagal membaca spreadsheet.\n${err.message}` });
@@ -1208,18 +1227,40 @@ async function processSpreadsheetUpload(sock, from, msg, caption = "") {
   return true;
 }
 
-function fastRepaymentTargetByPoint(sheet, minDpd, maxDpd, target, areaFilter = null) {
+function isRestructuredNo(row, detected) {
+  // KPI hanya menghitung loan dengan is_loan_restructured = NO.
+  // Jika kolom tidak ada, jangan diam-diam membuang data; caller akan memberi catatan.
+  if (!detected?.loanRestructured) return true;
+  return String(row[detected.loanRestructured] ?? "").trim().toLowerCase() === "no";
+}
+
+function getAutoRepaymentFileType(filename = "") {
+  const name = String(filename || "").toLowerCase();
+  if (/kp\s*daily|kp_daily|kpdaily/.test(name)) return null;
+  if (/dpd\s*1\s*[-–—]?\s*30|dpd[_\s-]*1[_\s-]*30|1\s*[-–—]?\s*30/.test(name)) return "dpd1_30";
+  if (/\bcurrent\b|\bcurent\b|current[_\s-]*loan|dpd\s*0|dpd[_\s-]*0/.test(name)) return "current";
+  return null;
+}
+
+function fastRepaymentByPoint(sheet, minDpd, maxDpd, target, areaFilter = null) {
   const d = sheet?.detected || {};
   if (!sheet || !d.point || !d.dpdOld || !d.paymentMin1x) return null;
 
   const targetArea = areaFilter ? String(areaFilter).trim().toLowerCase() : null;
   const byPoint = new Map();
+  let eligibleRows = 0;
+  let excludedRestructured = 0;
 
-  // SINGLE PASS: seluruh baris hanya dibaca sekali.
+  // SINGLE PASS: semua baris dibaca sekali.
   for (const r of sheet.rows) {
     if (targetArea && d.area) {
       const area = String(r[d.area] ?? "").trim().toLowerCase();
-      if (!area.includes(targetArea)) continue;
+      if (area !== targetArea && !area.includes(targetArea)) continue;
+    }
+
+    if (!isRestructuredNo(r, d)) {
+      excludedRestructured++;
+      continue;
     }
 
     const dpd = toNumber(r[d.dpdOld]);
@@ -1227,13 +1268,13 @@ function fastRepaymentTargetByPoint(sheet, minDpd, maxDpd, target, areaFilter = 
 
     const point = String(r[d.point] ?? "").trim();
     if (!point) continue;
+    eligibleRows++;
 
     let item = byPoint.get(point);
     if (!item) {
       item = { point, total: 0, paid: 0 };
       byPoint.set(point, item);
     }
-
     item.total += 1;
     if (isYes(r[d.paymentMin1x])) item.paid += 1;
   }
@@ -1242,17 +1283,61 @@ function fastRepaymentTargetByPoint(sheet, minDpd, maxDpd, target, areaFilter = 
     const achievement = item.total ? item.paid / item.total : 0;
     const gap = Math.max(0, target - achievement);
     const additionalNeeded = Math.max(0, Math.ceil(target * item.total - item.paid));
-    return {
-      ...item,
-      achievement,
-      gap,
-      additionalNeeded,
-      reached: achievement >= target,
-    };
+    return { ...item, achievement, gap, additionalNeeded, reached: achievement >= target };
   });
 
   rows.sort((a, b) => a.achievement - b.achievement || b.total - a.total);
-  return { rows, target, minDpd, maxDpd, areaFilter: targetArea, scannedRows: sheet.rows.length };
+  return {
+    rows, target, minDpd, maxDpd, areaFilter: targetArea,
+    scannedRows: sheet.rows.length, eligibleRows, excludedRestructured,
+    restructureColumn: d.loanRestructured || null,
+  };
+}
+
+function formatAutoRepayment(result, label) {
+  if (!result?.rows?.length) return `⚠️ Tidak ditemukan data *${label}* per point pada file ini.`;
+  const lines = result.rows.map((r, i) => {
+    const status = r.reached ? "✅ TERCAPAI" : `⚠️ Kurang ${formatPct(r.gap)}`;
+    const extra = r.reached ? "" : ` | Tambahan min. ${formatCompactNumber(r.additionalNeeded)} payment`;
+    return `${i + 1}. *${r.point}* — ${formatCompactNumber(r.paid)}/${formatCompactNumber(r.total)} = *${formatPct(r.achievement)}* | ${status}${extra}`;
+  });
+  const total = result.rows.reduce((a, r) => ({ total: a.total + r.total, paid: a.paid + r.paid }), { total: 0, paid: 0 });
+  const overall = total.total ? total.paid / total.total : 0;
+  const overallGap = Math.max(0, result.target - overall);
+  return `⚡ *${label} PER POINT*\nTarget KPI: *${formatPct(result.target)}*\n\n${lines.join("\n")}\n\n*TOTAL AREA*\n${formatCompactNumber(total.paid)}/${formatCompactNumber(total.total)} = *${formatPct(overall)}* | ${overall >= result.target ? "✅ TERCAPAI" : `⚠️ Kurang ${formatPct(overallGap)}`}`;
+}
+
+function inferAutoRepaymentFileType(sheet) {
+  const d = sheet?.detected || {};
+  if (!sheet || !d.dpdOld) return null;
+  let current = 0;
+  let dpd1_30 = 0;
+  for (const r of sheet.rows) {
+    if (d.loanRestructured && String(r[d.loanRestructured] ?? "").trim().toLowerCase() !== "no") continue;
+    const dpd = toNumber(r[d.dpdOld]);
+    if (dpd === 0) current++;
+    else if (dpd >= 1 && dpd <= 30) dpd1_30++;
+  }
+  if (current === 0 && dpd1_30 === 0) return null;
+  return current >= dpd1_30 ? "current" : "dpd1_30";
+}
+
+function buildAutoRepaymentAnalysis(sheet, fileType, areaFilter = "bangkalan") {
+  if (!sheet) return null;
+  const isCurrent = fileType === "current";
+  const result = fastRepaymentByPoint(
+    sheet,
+    isCurrent ? 0 : 1,
+    isCurrent ? 0 : 30,
+    isCurrent ? 0.98 : 0.55,
+    areaFilter
+  );
+  if (!result) return null;
+  return formatAutoRepayment(result, isCurrent ? "REPAYMENT CURRENT / DPD 0" : "REPAYMENT DPD 1–30");
+}
+
+function fastRepaymentTargetByPoint(sheet, minDpd, maxDpd, target, areaFilter = null) {
+  return fastRepaymentByPoint(sheet, minDpd, maxDpd, target, areaFilter);
 }
 
 function isRepayment55Question(question) {
@@ -1274,7 +1359,7 @@ function formatFastRepayment55(result) {
   const overall = total.total ? total.paid / total.total : 0;
   const overallGap = Math.max(0, result.target - overall);
 
-  return `⚡ *REPAYMENT DPD 1–30 PER POINT*\nTarget KPI: *${formatPct(result.target)}*\n\n${lines.join("\n")}\n\n*TOTAL AREA*\n${formatCompactNumber(total.paid)}/${formatCompactNumber(total.total)} = *${formatPct(overall)}* | ${overall >= result.target ? "✅ TERCAPAI" : `⚠️ Kurang ${formatPct(overallGap)}`}\n\n_Dihitung langsung dari seluruh ${formatCompactNumber(result.scannedRows)} baris Excel, tanpa Gemini._`;
+  return `⚡ *REPAYMENT DPD 1–30 PER POINT*\nTarget KPI: *${formatPct(result.target)}*\n\n${lines.join("\n")}\n\n*TOTAL AREA*\n${formatCompactNumber(total.paid)}/${formatCompactNumber(total.total)} = *${formatPct(overall)}* | ${overall >= result.target ? "✅ TERCAPAI" : `⚠️ Kurang ${formatPct(overallGap)}`}`;
 }
 
 function answerDataQuestion(sheet, question) {
