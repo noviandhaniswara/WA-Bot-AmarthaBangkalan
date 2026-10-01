@@ -1251,8 +1251,73 @@ function classifyDisbursementKind(v){const s=String(v??"").trim().toLowerCase();
 function kpiKpDailySummary(session){if(!session)return{available:false,error:"File KP Daily belum dimuat."};const sheet=activeSheetFor(session);const d=sheet.kpDetected||detectKpDailyColumns(sheet.columns||[]);const filtered=kpDailyRowsBangkalan(sheet);if(filtered.error)return{available:false,error:filtered.error,columns:d};const rows=filtered.rows;if(!d.amount||!d.kind)return{available:false,error:"Kolom nominal approval atau klasifikasi NTB/ETB pada KP Daily belum ditemukan.",columns:d,bangkalanRows:rows.length};let ntb=0,etb=0,ntbCount=0,etbCount=0;const bps=new Set();for(const r of rows){if(d.status&&!isApprovalStatus(r[d.status]))continue;const a=toNumber(r[d.amount]);const k=classifyDisbursementKind(r[d.kind]);if(d.bp&&String(r[d.bp]??"").trim())bps.add(String(r[d.bp]).trim());if(a===null||!k)continue;if(k==="NTB"){ntb+=a;ntbCount++;}else{etb+=a;etbCount++;}}const bpCount=bps.size;const ntbTarget=KPI_CONFIG.ntbPerBp*bpCount;const etbTarget=KPI_CONFIG.etbPerBp*bpCount;return{available:true,source:session.sourceName,area:"Bangkalan",rowCount:rows.length,bpCount,ntb:{actual:ntb,count:ntbCount,target:ntbTarget,achievement:ntbTarget?ntb/ntbTarget:null,score:ntbTarget?Math.min(ntb/ntbTarget,1.5):null},etb:{actual:etb,count:etbCount,target:etbTarget,achievement:etbTarget?etb/etbTarget:null,score:etbTarget?Math.min(etb/etbTarget,1.5):null},detected:d};}
 
 function buildKpiSnapshot(sheet,pointFilter=null,kpSession=null){const b0=kpiRepaymentBucket(sheet,pointFilter,0,0),b1=kpiRepaymentBucket(sheet,pointFilter,1,30),b31=kpiRepaymentBucket(sheet,pointFilter,31,90),di=kpiKpDailySummary(kpSession);const m=[{key:"dpd0",label:"Repayment DPD 0",target:KPI_CONFIG.dpd0.target,weight:.35,actual:b0?.repayment??null,score:scoreKpiDpd0(b0?.repayment??null)},{key:"dpd1_30",label:"Repayment DPD 1-30",target:.55,weight:.10,actual:b1?.repayment??null,score:scoreKpiDpd1_30(b1?.repayment??null)},{key:"dpd31_90",label:"Repayment DPD 31-90",target:.13,weight:.10,actual:b31?.repayment??null,score:scoreKpiDpd31_90(b31?.repayment??null)},{key:"ntb",label:"Disbursement NTB",target:di?.ntb?.target??null,weight:.25,actual:di?.ntb?.actual??null,score:di?.ntb?.score??null},{key:"etb",label:"Disbursement ETB",target:di?.etb?.target??null,weight:.20,actual:di?.etb?.actual??null,score:di?.etb?.score??null}];const av=m.filter(x=>Number.isFinite(x.score)),weighted=av.reduce((s,x)=>s+x.score*x.weight,0),wa=av.reduce((s,x)=>s+x.weight,0);return{point:pointFilter,metrics:m,weightedScore:weighted,availableWeight:wa,complete:av.length===m.length,buckets:{dpd0:b0,dpd1_30:b1,dpd31_90:b31},disbursement:di};}
+function formatRepaymentGapPerPoint(sheet, minDpd=1, maxDpd=30, target=0.55) {
+  if (!sheet?.detected?.point) return null;
+  if (!sheet?.detected?.dpdOld || !sheet?.detected?.paymentMin1x) return null;
+
+  const points = uniqueValues(sheet, sheet.detected.point);
+  if (!points.length) return null;
+
+  const rows = [];
+  for (const point of points) {
+    const bucket = kpiRepaymentBucket(sheet, point, minDpd, maxDpd);
+    if (!bucket || bucket.total <= 0) continue;
+
+    const achievement = bucket.repayment ?? 0;
+    const gap = Math.max(0, target - achievement);
+    const requiredPaid = Math.ceil(bucket.total * target);
+    const additionalPaid = Math.max(0, requiredPaid - bucket.paid);
+
+    rows.push({
+      point,
+      total: bucket.total,
+      paid: bucket.paid,
+      achievement,
+      gap,
+      requiredPaid,
+      additionalPaid,
+    });
+  }
+
+  if (!rows.length) return null;
+
+  return rows.sort((a, b) => b.achievement - a.achievement);
+}
+
+function isFastRepaymentGapQuestion(question) {
+  const q = normalizeForSearch(question);
+  const hasPayment1x = /1x\s*payment|payment\s*1x|payment\s*min\s*1x|payment\s*>=?\s*1x|bayar\s*1x|pembayaran\s*1x/.test(q);
+  const hasAchievement = /pencapaian|achievement|repayment|capaian/.test(q);
+  const hasGap = /kekurangan|kurang|gap|selisih|target\s*55|55\s*%|55persen/.test(q);
+  const hasPerPoint = /masing2|masing masing|per point|tiap point|setiap point|semua point|masing masing point/.test(q);
+  return hasPayment1x && (hasAchievement || hasGap) && hasPerPoint;
+}
+
+function answerFastRepaymentGap(sheet, question) {
+  if (!isFastRepaymentGapQuestion(question)) return null;
+
+  const target = KPI_CONFIG.dpd1_30.target;
+  const rows = formatRepaymentGapPerPoint(sheet, 1, 30, target);
+  if (!rows) {
+    return "❌ Data belum cukup. Marley membutuhkan kolom Point, DPD Old, dan Payment Min 1x untuk menghitung Repayment DPD 1–30.";
+  }
+
+  const lines = rows.map((r) => {
+    const status = r.gap <= 0 ? "✅ TERCAPAI" : `⚠️ Kurang ${formatPct(r.gap)}`;
+    const add = r.additionalPaid > 0 ? ` | Tambahan minimal: ${r.additionalPaid} payment` : "";
+    return `${r.point}: ${formatCompactNumber(r.paid)}/${formatCompactNumber(r.total)} = ${formatPct(r.achievement)} | ${status}${add}`;
+  });
+
+  const overallTotal = rows.reduce((s, r) => s + r.total, 0);
+  const overallPaid = rows.reduce((s, r) => s + r.paid, 0);
+  const overallAchievement = overallTotal ? overallPaid / overallTotal : 0;
+  const overallGap = Math.max(0, target - overallAchievement);
+
+  return `⚡ *REPAYMENT DPD 1–30 PER POINT*\n\nTarget KPI: *${formatPct(target)}*\n\n${lines.join("\n")}\n\n*Area keseluruhan:* ${formatCompactNumber(overallPaid)}/${formatCompactNumber(overallTotal)} = ${formatPct(overallAchievement)}\n${overallGap > 0 ? `Kekurangan area ke target: *${formatPct(overallGap)}*` : "Target area sudah tercapai."}\n\n📌 Perhitungan: Payment Min 1x = Yes ÷ seluruh loan DPD 1–30. Perhitungan dilakukan langsung dari seluruh baris Excel, tanpa Gemini.`;
+}
+
 function formatKpiMetricLine(m){const money=m.key==="ntb"||m.key==="etb",t=money?(m.target===null?"N/A":formatMoney(m.target)):formatPct(m.target),a=money?(m.actual===null?"-":formatMoney(m.actual)):formatPct(m.actual),s=Number.isFinite(m.score)?formatPct(m.score):"N/A";return`• ${m.label}: actual ${a} | target ${t} | score ${s} | bobot ${formatPct(m.weight)}`;}
-function answerKpiQuestion(sheet,question,kpSession=null){const q=String(question||"").toLowerCase(),point=sheet?detectPointFromQuestion(question,sheet):null;if(/ranking|per point|point mana|point tertinggi|point terendah/.test(q)&&sheet?.detected?.point){const arr=uniqueValues(sheet,sheet.detected.point).map(p=>({p,k:buildKpiSnapshot(sheet,p,kpSession)})).filter(x=>x.k.availableWeight>0).sort((a,b)=>b.k.weightedScore-a.k.weightedScore).slice(0,10);return`📊 *KPI PER POINT*\n\n${arr.map((x,i)=>`${i+1}. ${x.p}: ${formatPct(x.k.weightedScore)} | bobot tersedia ${formatPct(x.k.availableWeight)}`).join("\n")}\n\nCatatan: NTB/ETB berasal dari KP Daily Area Bangkalan; parameter yang tidak tersedia tidak dianggap 0.`;}
+function answerKpiQuestion(sheet,question,kpSession=null){const fastRepayment=answerFastRepaymentGap(sheet,question);if(fastRepayment)return fastRepayment;const q=String(question||"").toLowerCase(),point=sheet?detectPointFromQuestion(question,sheet):null;if(/ranking|per point|point mana|point tertinggi|point terendah/.test(q)&&sheet?.detected?.point){const arr=uniqueValues(sheet,sheet.detected.point).map(p=>({p,k:buildKpiSnapshot(sheet,p,kpSession)})).filter(x=>x.k.availableWeight>0).sort((a,b)=>b.k.weightedScore-a.k.weightedScore).slice(0,10);return`📊 *KPI PER POINT*\n\n${arr.map((x,i)=>`${i+1}. ${x.p}: ${formatPct(x.k.weightedScore)} | bobot tersedia ${formatPct(x.k.availableWeight)}`).join("\n")}\n\nCatatan: NTB/ETB berasal dari KP Daily Area Bangkalan; parameter yang tidak tersedia tidak dianggap 0.`;}
 if(!/(kpi|repayment|ntb|etb|disbursement|dpd)/.test(q))return null;const k=buildKpiSnapshot(sheet||{detected:{},rows:[]},point,kpSession),lines=k.metrics.map(formatKpiMetricLine).join("\n"),total=k.complete?`\n\n*Weighted KPI Score: ${formatPct(k.weightedScore)}*`:`\n\n*Weighted Score tersedia: ${formatPct(k.weightedScore)}*\nBobot parameter tersedia: ${formatPct(k.availableWeight)}\nParameter yang belum dapat dihitung tidak dianggap 0.`;const sourceNote=k.disbursement.available?`\n\n📁 Sumber NTB/ETB: *${k.disbursement.source}* — filter *Area Bangkalan* (${k.disbursement.rowCount.toLocaleString("id-ID")} baris).`:`\n\n⚠️ NTB/ETB: ${k.disbursement.error||"KP Daily belum tersedia."}`;return`🎯 *KPI INTELLIGENCE V5*\n${point?`Point: ${point}`:"Area: Bangkalan untuk NTB/ETB"}\n\n${lines}${total}${sourceNote}`;}
 
 async function processKpDailyUpload(sock,from,msg,caption=""){const document=msg.message?.documentMessage||msg.message?.documentWithCaptionMessage?.message?.documentMessage;if(!document)return false;const filename=document.fileName||"KP Daily";const mime=document.mimetype||"application/octet-stream";if(!isKpDailySourceName(filename)&&!/kp\s*daily/i.test(caption))return false;if(!/\.(xlsx|xls|csv)$/i.test(filename)&&!/spreadsheet|excel|csv/i.test(mime))return false;try{await sock.sendMessage(from,{text:`📊 Marley membaca *${filename}* sebagai sumber *KP Daily*...`});const buffer=await downloadMediaMessage(msg,"buffer",{});const session=await loadSpreadsheetBuffer(buffer,filename);for(const s of session.sheets)s.kpDetected=detectKpDailyColumns(s.columns);kpDailySessions.set(from,session);const sh=activeSheetFor(session),d=sh.kpDetected;const area=d.area?uniqueValues(sh,d.area):[];await sock.sendMessage(from,{text:`✅ *KP Daily berhasil dimuat.*\nSumber: ${filename}\nSheet: ${session.sheets.length}\nArea terdeteksi: ${area.slice(0,10).join(", ")||"-"}\n\nMarley akan mengambil *hanya Area Bangkalan* untuk NTB/ETB.`});}catch(err){console.error("KP Daily upload error:",err);await sock.sendMessage(from,{text:`❌ Marley gagal membaca KP Daily.\n${err.message}`});}return true;}
