@@ -896,6 +896,7 @@ function detectDatasetColumns(columns) {
     loanKind: findColumn(columns, ["loan_kind"]),
     group: findColumn(columns, ["group_name"]),
   };
+}
 
 function detectKpDailyColumns(columns) {
   return {
@@ -2152,4 +2153,3 @@ bootstrap().catch((err) => {
   console.error("BOOTSTRAP ERROR:", err);
   process.exit(1);
 });
-}
