@@ -323,6 +323,7 @@ ATURAN PERCAKAPAN:
 - Jangan mengatakan "dari riwayat percakapan tersebut", "berdasarkan percakapan", atau menjelaskan proses internalmu kecuali memang diminta.
 - Riwayat chat yang diberikan hanyalah KONTEKS untuk memahami siapa, apa, dan maksud pembicaraan; riwayat tersebut BUKAN tugas untuk dirangkum.
 - Jika user mengoreksi sesuatu, akui dan sesuaikan jawaban. Contoh: jika dipanggil "Bos", ikuti panggilan tersebut secara natural.
+- Jika tersedia informasi "ORANG YANG DI-TAG PADA PESAN INI", gunakan informasi itu untuk memahami siapa yang sedang disebut/dituju. Jangan mengarang nama dari tanda @.
 - Gunakan Bahasa Indonesia yang natural dan santai, sesuai gaya grup kerja.
 - Untuk pertanyaan sederhana, jawab sederhana. Jangan membuat jawaban panjang tanpa alasan.
 - Boleh bercanda ringan jika konteksnya santai, tetapi tetap sopan.
@@ -1558,6 +1559,49 @@ function stripMentions(text) {
   return cleaned.trim();
 }
 
+async function resolveMentionedUsers(sock, groupId, mentionedJids = []) {
+  if (!groupId?.endsWith("@g.us") || !mentionedJids.length) return [];
+
+  try {
+    const metadata = await sock.groupMetadata(groupId);
+    const participants = metadata?.participants || [];
+
+    const normalizeJid = (jid) =>
+      String(jid || "")
+        .replace(/:\d+(?=@)/, "")
+        .trim();
+
+    return mentionedJids.map((jid) => {
+      const cleanJid = normalizeJid(jid);
+      const participant = participants.find(
+        (p) => normalizeJid(p.id || p.jid || p.lid) === cleanJid
+      );
+
+      const displayName =
+        participant?.notify ||
+        participant?.name ||
+        participant?.vname ||
+        participant?.shortName ||
+        cleanJid.split("@")[0];
+
+      return { jid: cleanJid, name: displayName };
+    });
+  } catch (err) {
+    console.warn("Gagal membaca metadata mention grup:", err?.message || err);
+    return mentionedJids.map((jid) => ({
+      jid: String(jid),
+      name: String(jid).split("@")[0].replace(/:.*$/, ""),
+    }));
+  }
+}
+
+function formatMentionContext(mentionedUsers = []) {
+  if (!mentionedUsers.length) return "";
+  return mentionedUsers
+    .map((u) => `- ${u.name} (${u.jid})`)
+    .join("\n");
+}
+
 // ======================================================
 // START BOT
 // ======================================================
@@ -1658,6 +1702,10 @@ async function startBot() {
       const mentionedJids =
         msg.message.extendedTextMessage?.contextInfo
           ?.mentionedJid || [];
+
+      // Baca siapa saja yang benar-benar di-tag di WhatsApp.
+      const mentionedUsers =
+        await resolveMentionedUsers(sock, from, mentionedJids);
 
       const textTrigger = containsBotTrigger(text);
 
@@ -2074,8 +2122,16 @@ async function startBot() {
             return;
           }
 
-          const context =
-            formatHistory(from);
+          const historyContext = formatHistory(from);
+          const mentionContext = formatMentionContext(mentionedUsers);
+          const context = [
+            historyContext,
+            mentionContext
+              ? `ORANG YANG DI-TAG PADA PESAN INI:\n${mentionContext}`
+              : "",
+          ]
+            .filter(Boolean)
+            .join("\n\n");
 
           const result =
             await askGemini(
