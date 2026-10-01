@@ -1190,9 +1190,16 @@ async function processSpreadsheetUpload(sock, from, msg, caption = "") {
   const isGroup = from.endsWith("@g.us");
   const filename = document.fileName || "spreadsheet";
   const autoFileType = getAutoRepaymentFileType(filename);
-  // File Current / DPD 1-30 boleh diproses otomatis tanpa harus mengetik "Marley".
+  const captionType = getAutoRepaymentFileType(caption);
+  // File Current / DPD 1-30 boleh diproses otomatis tanpa mengetik "Marley".
+  // Caption juga dapat dipakai sebagai trigger: "current", "dpd 0", "1-30", dll.
   // File spreadsheet lain di grup tetap membutuhkan trigger agar Marley tidak terlalu banyak bicara.
-  const allowedCaption = !isGroup || containsBotTrigger(caption) || /^\s*\/excel\b/i.test(caption) || Boolean(autoFileType);
+  const allowedCaption =
+    !isGroup ||
+    containsBotTrigger(caption) ||
+    /^\s*\/excel\b/i.test(caption) ||
+    Boolean(autoFileType) ||
+    Boolean(captionType);
   if (!allowedCaption) return false;
   const mime = document.mimetype || "application/octet-stream";
   if (!/\.(xlsx|xls|csv)$/i.test(filename) && !/spreadsheet|excel|csv/i.test(mime)) return false;
@@ -1202,7 +1209,7 @@ async function processSpreadsheetUpload(sock, from, msg, caption = "") {
     const buffer = await downloadMediaMessage(msg, "buffer", {});
     const session = await loadSpreadsheetBuffer(buffer, filename);
     spreadsheetSessions.set(from, session);
-    const autoType = autoFileType || inferAutoRepaymentFileType(activeSheetFor(session));
+    const autoType = autoFileType || captionType || inferAutoRepaymentFileType(activeSheetFor(session));
     await persistSpreadsheetSession(from, buffer, filename);
     console.log(`[EXCEL SAVED] ${from} -> ${filename}`);
 
@@ -1234,11 +1241,22 @@ function isRestructuredNo(row, detected) {
   return String(row[detected.loanRestructured] ?? "").trim().toLowerCase() === "no";
 }
 
-function getAutoRepaymentFileType(filename = "") {
-  const name = String(filename || "").toLowerCase();
+function getAutoRepaymentFileType(value = "") {
+  const name = String(value || "").toLowerCase().trim();
+  if (!name) return null;
   if (/kp\s*daily|kp_daily|kpdaily/.test(name)) return null;
-  if (/dpd\s*1\s*[-–—]?\s*30|dpd[_\s-]*1[_\s-]*30|1\s*[-–—]?\s*30/.test(name)) return "dpd1_30";
-  if (/\bcurrent\b|\bcurent\b|current[_\s-]*loan|dpd\s*0|dpd[_\s-]*0/.test(name)) return "current";
+
+  // DPD 1-30: menerima beberapa format nama file/caption.
+  if (/dpd\s*1\s*[-–—]?\s*30|dpd[_\s-]*1[_\s-]*30|(^|[^0-9])1\s*[-–—]\s*30([^0-9]|$)/.test(name)) {
+    return "dpd1_30";
+  }
+
+  // Current / DPD 0: sengaja menerima typo "curent" yang umum muncul
+  // pada nama file export, selain current/curr/current loan/dpd 0.
+  if (/\bcurrent\b|\bcurent\b|current[_\s-]*loan|curr[_\s-]*loan|dpd\s*0|dpd[_\s-]*0/.test(name)) {
+    return "current";
+  }
+
   return null;
 }
 
