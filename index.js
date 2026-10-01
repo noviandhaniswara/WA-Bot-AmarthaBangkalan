@@ -1118,8 +1118,8 @@ async function loadPublicGoogleSheet(url) {
 
 function detectAutoKpiFileType(filename, caption = "") {
   const s = `${String(filename || "")} ${String(caption || "")}`.toLowerCase();
-  if (/dpd[\s_-]*1[\s_-]*30|\b1[\s_-]*30\b/.test(s)) return "dpd1_30";
-  if (/\bcur+ent\b|dpd[\s_-]*0|\b0[\s_-]*dpd\b/.test(s)) return "current";
+  if (/dpd[\s_-]*1[\s_-]*30|1[\s_-]*30/.test(s)) return "dpd1_30";
+  if (/cur+ent|dpd[\s_-]*0|0[\s_-]*dpd/.test(s)) return "current";
   return null;
 }
 
@@ -1173,6 +1173,7 @@ async function processSpreadsheetUpload(sock, from, msg, caption = "") {
   const mime = document.mimetype || "application/octet-stream";
   if (!/\.(xlsx|xls|csv)$/i.test(filename) && !/spreadsheet|excel|csv/i.test(mime)) return false;
   const autoKpiType = detectAutoKpiFileType(filename, caption);
+  console.log(`[AUTO KPI] file=${filename} caption=${JSON.stringify(caption)} type=${autoKpiType || "NONE"}`);
   const allowedCaption = !isGroup || autoKpiType || containsBotTrigger(caption) || /^\s*\/excel\b/i.test(caption);
   if (!allowedCaption) return false;
   if (isKpDailySourceName(filename) || /kp\s*daily/i.test(caption)) return processKpDailyUpload(sock, from, msg, caption);
@@ -1724,18 +1725,6 @@ async function startBot() {
 
       if (!msg?.message) return;
 
-      // Pesan biasa dari akun bot sendiri diabaikan untuk mencegah loop.
-      // Tetapi file Excel/CSV Current atau DPD 1-30 yang dikirim dari akun
-      // yang sama tetap harus diproses karena user memang mengirim file dari nomor Marley.
-      const ownDocument =
-        msg.message.documentMessage ||
-        msg.message.documentWithCaptionMessage?.message?.documentMessage;
-      const ownDocumentName = ownDocument?.fileName || "";
-      const ownSpreadsheet =
-        !!ownDocument && /\.(xlsx|xls|csv)$/i.test(ownDocumentName);
-
-      if (msg.key.fromMe && !ownSpreadsheet) return;
-
       const from = msg.key.remoteJid;
       if (!from) return;
 
@@ -1765,6 +1754,10 @@ async function startBot() {
       } catch (spreadsheetErr) {
         console.error("Spreadsheet engine error:", spreadsheetErr);
       }
+
+      // Pesan teks yang dikirim oleh akun bot sendiri tetap diabaikan agar tidak loop.
+      // File spreadsheet sudah diproses di atas sebelum pengecekan fromMe.
+      if (msg.key.fromMe) return;
 
       const mentionedJids =
         msg.message.extendedTextMessage?.contextInfo
