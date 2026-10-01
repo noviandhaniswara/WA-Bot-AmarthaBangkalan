@@ -1544,9 +1544,11 @@ function stripMentions(text) {
 // START BOT
 // ======================================================
 
+const AUTH_DIR = process.env.AUTH_DIR || "/app/data/auth_info_baileys";
+
 async function startBot() {
   const { state, saveCreds } =
-    await useMultiFileAuthState("auth_info_baileys");
+    await useMultiFileAuthState(AUTH_DIR);
 
   const sock = makeWASocket({
     auth: state,
