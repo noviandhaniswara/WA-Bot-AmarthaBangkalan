@@ -1573,9 +1573,12 @@ async function resolveMentionedUsers(sock, groupId, mentionedJids = []) {
 
     return mentionedJids.map((jid) => {
       const cleanJid = normalizeJid(jid);
-      const participant = participants.find(
-        (p) => normalizeJid(p.id || p.jid || p.lid) === cleanJid
-      );
+      const participant = participants.find((p) => {
+        const candidateJids = [p.id, p.jid, p.lid]
+          .filter(Boolean)
+          .map(normalizeJid);
+        return candidateJids.includes(cleanJid);
+      });
 
       const displayName =
         participant?.notify ||
@@ -1584,7 +1587,16 @@ async function resolveMentionedUsers(sock, groupId, mentionedJids = []) {
         participant?.shortName ||
         cleanJid.split("@")[0];
 
-      return { jid: cleanJid, name: displayName };
+      const participantJids = participant
+        ? [participant.id, participant.jid, participant.lid].filter(Boolean).map(normalizeJid)
+        : [];
+
+      const isBot = !!botJid && participantJids.some((candidate) => {
+        const number = candidate.split("@")[0].split(":")[0];
+        return number === String(botJid).split("@")[0].split(":")[0];
+      });
+
+      return { jid: cleanJid, name: displayName, isBot };
     });
   } catch (err) {
     console.warn("Gagal membaca metadata mention grup:", err?.message || err);
@@ -1710,10 +1722,9 @@ async function startBot() {
       const textTrigger = containsBotTrigger(text);
 
       const officialMention =
-        botJid &&
-        mentionedJids.some((jid) =>
-          jid.includes(botJid)
-        );
+        !!botJid &&
+        (mentionedUsers.some((u) => u.isBot) ||
+          mentionedJids.some((jid) => String(jid).includes(String(botJid))));
 
       const isMentioned =
         isGroup &&
@@ -1725,6 +1736,7 @@ async function startBot() {
         console.log("text:", JSON.stringify(text));
         console.log("botJid:", botJid);
         console.log("mentionedJids:", mentionedJids);
+        console.log("mentionedUsers:", mentionedUsers);
         console.log("textTrigger:", textTrigger);
         console.log("officialMention:", officialMention);
         console.log("isMentioned:", isMentioned);
