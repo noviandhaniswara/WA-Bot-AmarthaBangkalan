@@ -828,6 +828,7 @@ async function processIncomingDailyReport(sock, from, sender, text) {
 // ======================================================
 
 const spreadsheetSessions = new Map();
+const kpDailySessions = new Map();
 const SPREADSHEET_DIR = path.join(__dirname, "data", "spreadsheet_cache");
 
 async function ensureSpreadsheetDir() {
@@ -894,6 +895,17 @@ function detectDatasetColumns(columns) {
     loanState: findColumn(columns, ["loan_state"]),
     loanKind: findColumn(columns, ["loan_kind"]),
     group: findColumn(columns, ["group_name"]),
+  };
+
+function detectKpDailyColumns(columns) {
+  return {
+    area: findColumn(columns, ["area", "area_name", "regional_area", "region_area", "nama_area"]),
+    point: findColumn(columns, ["branch_name", "point", "point_name", "branch", "nama_point"]),
+    bp: findColumn(columns, ["bp_username", "bp_name", "agent_fullname", "agent_name", "bp"]),
+    amount: findColumn(columns, ["approval_amount", "approved_amount", "approval_nominal", "nominal_approval", "nominal_disbursement", "disbursement_amount", "disb_amount", "uk_disbursement", "loan_amount", "amount"]),
+    kind: findColumn(columns, ["loan_kind", "customer_type", "mitra_type", "disbursement_type", "loan_type", "jenis_mitra", "tipe_mitra", "jenis_loan"]),
+    status: findColumn(columns, ["approval_status", "status_approval", "status", "approval_result", "decision"]),
+    date: findColumn(columns, ["approval_date", "approved_date", "tanggal_approval", "tanggal_approve", "date", "tanggal"]),
   };
 }
 
@@ -1093,6 +1105,7 @@ async function processSpreadsheetUpload(sock, from, msg, caption = "") {
   const filename = document.fileName || "spreadsheet";
   const mime = document.mimetype || "application/octet-stream";
   if (!/\.(xlsx|xls|csv)$/i.test(filename) && !/spreadsheet|excel|csv/i.test(mime)) return false;
+  if (isKpDailySourceName(filename) || /kp\s*daily/i.test(caption)) return processKpDailyUpload(sock, from, msg, caption);
   try {
     await sock.sendMessage(from, { text: `📊 Marley sedang membaca *${filename}*...` });
     const buffer = await downloadMediaMessage(msg, "buffer", {});
@@ -1181,7 +1194,7 @@ async function processSpreadsheetLink(sock, from, text) {
 async function processSpreadsheetCommand(sock, from, command) {
   const session=spreadsheetSessions.get(from);
   if(command==="/data"||command==="/sheet"){await sock.sendMessage(from,{text:listSpreadsheetStatus(session)});return true;}
-  if(command==="/kpi"||command==="/kpiranking"||command.startsWith("/kpi ")){if(!session){await sock.sendMessage(from,{text:"Belum ada spreadsheet yang dimuat."});return true;}const sheet=activeSheetFor(session),q=command==="/kpiranking"?"ranking kpi per point":command.slice(4).trim()||"kpi";await sock.sendMessage(from,{text:answerKpiQuestion(sheet,q)||"Belum ada data KPI yang dapat dihitung."});return true;}
+  if(command==="/kpi"||command==="/kpiranking"||command.startsWith("/kpi ")){const kpSession=kpDailySessions.get(from);if(!session&&!kpSession){await sock.sendMessage(from,{text:"Belum ada file KPI/Portfolio atau KP Daily yang dimuat."});return true;}const sheet=session?activeSheetFor(session):null,q=command==="/kpiranking"?"ranking kpi per point":command.slice(4).trim()||"kpi";await sock.sendMessage(from,{text:answerKpiQuestion(sheet,q,kpSession)||"Belum ada data KPI yang dapat dihitung."});return true;}
   if(command==="/grafik"||command.startsWith("/grafik ")){
     if(!session){await sock.sendMessage(from,{text:"Belum ada spreadsheet yang dimuat."});return true;}
     const sheet=activeSheetFor(session), arg=command.slice(7).trim().toLowerCase();
@@ -1200,21 +1213,30 @@ async function processSpreadsheetCommand(sock, from, command) {
 
 // ======================================================
 // KPI INTELLIGENCE MARLEY V5
-// Based on: Sosialisasi KPI FO - September 2026
-// Deterministic KPI calculation; missing source fields are never guessed.
+// Repayment: Portfolio/loan file.
+// NTB & ETB: KP Daily (daily approval process) ONLY.
+// KP Daily is regional; Marley filters Area = Bangkalan only.
 // ======================================================
 const KPI_CONFIG={dpd0:{target:.98,weight:.35},dpd1_30:{target:.55,weight:.10},dpd31_90:{target:.13,weight:.10},ntbPerBp:Number(process.env.KPI_NTB_PER_BP||100000000),etbPerBp:Number(process.env.KPI_ETB_PER_BP||175000000),ntbWeight:.25,etbWeight:.20};
 function scoreKpiDpd0(r){if(!Number.isFinite(r))return null;if(r<.90)return 0;if(r<.93)return .25;if(r<.94)return .50;if(r<.95)return .60;if(r<.96)return .70;if(r<.97)return .80;if(r<=.98)return 1;return 1.20;}
 function scoreKpiDpd1_30(r){if(!Number.isFinite(r))return null;if(r<=KPI_CONFIG.dpd1_30.target)return r/KPI_CONFIG.dpd1_30.target;if(r<=.65)return 1.20;return 1.30;}
 function scoreKpiDpd31_90(r){if(!Number.isFinite(r))return null;if(r<=KPI_CONFIG.dpd31_90.target)return r/KPI_CONFIG.dpd31_90.target;if(r<=.20)return 1.20;return 1.30;}
+
 function kpiRepaymentBucket(sheet,pointFilter,minDpd,maxDpd){const d=sheet.detected;if(!d.dpdOld||!d.paymentMin1x)return null;const rows=filterRows(sheet,pointFilter);let total=0,paid=0,paymentAmount=0,os=0,arrears=0;for(const r of rows){const dpd=toNumber(r[d.dpdOld]);if(dpd===null||dpd<minDpd||dpd>maxDpd)continue;total++;if(isYes(r[d.paymentMin1x]))paid++;if(d.payment)paymentAmount+=toNumber(r[d.payment])||0;if(d.osNew)os+=toNumber(r[d.osNew])||0;if(d.arrears)arrears+=toNumber(r[d.arrears])||0;}return{total,paid,unpaid:total-paid,repayment:total?paid/total:null,paymentAmount,os,arrears};}
-function findKpiDisbursementColumns(sheet){const c=sheet.columns||[];return{amount:findColumn(c,["disbursement_amount","disburse_amount","disb_amount","nominal_disbursement","nominal_disb","uk_disbursement","uk_amount","loan_amount"]),kind:findColumn(c,["loan_kind","customer_type","mitra_type","disbursement_type","loan_type"])};}
-function classifyDisbursementKind(v){const s=String(v??"").trim().toLowerCase();if(/\bntb\b|baru|new/.test(s))return"NTB";if(/\betb\b|lanjutan|existing|repeat/.test(s))return"ETB";return null;}
-function kpiDisbursementSummary(sheet,pointFilter){const d=sheet.detected,e=findKpiDisbursementColumns(sheet),amountCol=e.amount,kindCol=e.kind||d.loanKind;if(!amountCol||!kindCol)return{available:false,amountColumn:amountCol,kindColumn:kindCol,ntb:null,etb:null};const rows=filterRows(sheet,pointFilter),bps=new Set();if(d.bp)for(const r of rows){const bp=String(r[d.bp]??"").trim();if(bp)bps.add(bp);}let ntb=0,etb=0;for(const r of rows){const k=classifyDisbursementKind(r[kindCol]),a=toNumber(r[amountCol]);if(a===null||!k)continue;if(k==="NTB")ntb+=a;if(k==="ETB")etb+=a;}const bpCount=bps.size,ntbTarget=KPI_CONFIG.ntbPerBp*bpCount,etbTarget=KPI_CONFIG.etbPerBp*bpCount;return{available:true,amountColumn:amountCol,kindColumn:kindCol,bpCount,ntb:{actual:ntb,target:ntbTarget,achievement:ntbTarget?ntb/ntbTarget:null,score:ntbTarget?Math.min(ntb/ntbTarget,1.5):null},etb:{actual:etb,target:etbTarget,achievement:etbTarget?etb/etbTarget:null,score:etbTarget?Math.min(etb/etbTarget,1.5):null}};}
-function buildKpiSnapshot(sheet,pointFilter=null){const b0=kpiRepaymentBucket(sheet,pointFilter,0,0),b1=kpiRepaymentBucket(sheet,pointFilter,1,30),b31=kpiRepaymentBucket(sheet,pointFilter,31,90),di=kpiDisbursementSummary(sheet,pointFilter);const m=[{key:"dpd0",label:"Repayment DPD 0",target:KPI_CONFIG.dpd0.target,weight:.35,actual:b0?.repayment??null,score:scoreKpiDpd0(b0?.repayment??null)},{key:"dpd1_30",label:"Repayment DPD 1-30",target:.55,weight:.10,actual:b1?.repayment??null,score:scoreKpiDpd1_30(b1?.repayment??null)},{key:"dpd31_90",label:"Repayment DPD 31-90",target:.13,weight:.10,actual:b31?.repayment??null,score:scoreKpiDpd31_90(b31?.repayment??null)},{key:"ntb",label:"Disbursement NTB",target:di?.ntb?.target??null,weight:.25,actual:di?.ntb?.actual??null,score:di?.ntb?.score??null},{key:"etb",label:"Disbursement ETB",target:di?.etb?.target??null,weight:.20,actual:di?.etb?.actual??null,score:di?.etb?.score??null}];const av=m.filter(x=>Number.isFinite(x.score)),weighted=av.reduce((s,x)=>s+x.score*x.weight,0),wa=av.reduce((s,x)=>s+x.weight,0);return{point:pointFilter,metrics:m,weightedScore:weighted,availableWeight:wa,complete:av.length===m.length,buckets:{dpd0:b0,dpd1_30:b1,dpd31_90:b31},disbursement:di};}
-function formatKpiMetricLine(m){const money=m.key==="ntb"||m.key==="etb",t=money?formatMoney(m.target):formatPct(m.target),a=money?(m.actual===null?"-":formatMoney(m.actual)):formatPct(m.actual),s=Number.isFinite(m.score)?formatPct(m.score):"N/A";return`• ${m.label}: actual ${a} | target ${t} | score ${s} | bobot ${formatPct(m.weight)}`;}
-function answerKpiQuestion(sheet,question){const q=String(question||"").toLowerCase(),point=detectPointFromQuestion(question,sheet);if(/ranking|per point|point mana|point terbaik|point tertinggi|point terendah/.test(q)&&sheet.detected.point){const arr=uniqueValues(sheet,sheet.detected.point).map(p=>({p,k:buildKpiSnapshot(sheet,p)})).sort((a,b)=>b.k.weightedScore-a.k.weightedScore).slice(0,10);return`📊 *KPI RANKING PER POINT*\n\n${arr.map((x,i)=>`${i+1}. ${x.p}: ${formatPct(x.k.weightedScore)} | bobot tersedia ${formatPct(x.k.availableWeight)}`).join("\n")}\n\nCatatan: parameter yang tidak tersedia di file tidak dianggap 0.`;}
-if(!/(kpi|repayment|ntb|etb|disbursement|dpd)/.test(q))return null;const k=buildKpiSnapshot(sheet,point),lines=k.metrics.map(formatKpiMetricLine).join("\n"),total=k.complete?`\n\n*Weighted KPI Score: ${formatPct(k.weightedScore)}*`:`\n\n*Weighted Score tersedia: ${formatPct(k.weightedScore)}*\nBobot parameter tersedia: ${formatPct(k.availableWeight)}\nParameter yang belum dapat dihitung tidak dianggap 0.`;return`🎯 *KPI INTELLIGENCE V5*\n${point?`Point: ${point}`:"Seluruh data/file"}\n\n${lines}${total}`;}
+
+function isKpDailySourceName(name){return /kp\s*daily|kp_daily|kpdaily/i.test(String(name||""));}
+function isApprovalStatus(value){const s=String(value??"").trim().toLowerCase();if(!s)return true;return /approve|approved|approval|disetujui|setuju|lolos|approved\s*\/\s*approve/i.test(s);}
+function normalizeArea(value){return String(value??"").trim().toLowerCase().replace(/\s+/g," ");}
+function kpDailyRowsBangkalan(sheet){const d=sheet.kpDetected||detectKpDailyColumns(sheet.columns||[]);if(!d.area)return{rows:[],error:"Kolom Area pada KP Daily belum ditemukan. Karena file bersifat regional, Marley tidak akan mencampur 4 area tanpa filter Area Bangkalan."};const rows=sheet.rows.filter(r=>normalizeArea(r[d.area])==="bangkalan");return{rows,error:null};}
+function classifyDisbursementKind(v){const s=String(v??"").trim().toLowerCase();if(/\bntb\b|mitra\s*baru|baru|new/.test(s))return"NTB";if(/\betb\b|mitra\s*lanjutan|lanjutan|existing|repeat/.test(s))return"ETB";return null;}
+function kpiKpDailySummary(session){if(!session)return{available:false,error:"File KP Daily belum dimuat."};const sheet=activeSheetFor(session);const d=sheet.kpDetected||detectKpDailyColumns(sheet.columns||[]);const filtered=kpDailyRowsBangkalan(sheet);if(filtered.error)return{available:false,error:filtered.error,columns:d};const rows=filtered.rows;if(!d.amount||!d.kind)return{available:false,error:"Kolom nominal approval atau klasifikasi NTB/ETB pada KP Daily belum ditemukan.",columns:d,bangkalanRows:rows.length};let ntb=0,etb=0,ntbCount=0,etbCount=0;const bps=new Set();for(const r of rows){if(d.status&&!isApprovalStatus(r[d.status]))continue;const a=toNumber(r[d.amount]);const k=classifyDisbursementKind(r[d.kind]);if(d.bp&&String(r[d.bp]??"").trim())bps.add(String(r[d.bp]).trim());if(a===null||!k)continue;if(k==="NTB"){ntb+=a;ntbCount++;}else{etb+=a;etbCount++;}}const bpCount=bps.size;const ntbTarget=KPI_CONFIG.ntbPerBp*bpCount;const etbTarget=KPI_CONFIG.etbPerBp*bpCount;return{available:true,source:session.sourceName,area:"Bangkalan",rowCount:rows.length,bpCount,ntb:{actual:ntb,count:ntbCount,target:ntbTarget,achievement:ntbTarget?ntb/ntbTarget:null,score:ntbTarget?Math.min(ntb/ntbTarget,1.5):null},etb:{actual:etb,count:etbCount,target:etbTarget,achievement:etbTarget?etb/etbTarget:null,score:etbTarget?Math.min(etb/etbTarget,1.5):null},detected:d};}
+
+function buildKpiSnapshot(sheet,pointFilter=null,kpSession=null){const b0=kpiRepaymentBucket(sheet,pointFilter,0,0),b1=kpiRepaymentBucket(sheet,pointFilter,1,30),b31=kpiRepaymentBucket(sheet,pointFilter,31,90),di=kpiKpDailySummary(kpSession);const m=[{key:"dpd0",label:"Repayment DPD 0",target:KPI_CONFIG.dpd0.target,weight:.35,actual:b0?.repayment??null,score:scoreKpiDpd0(b0?.repayment??null)},{key:"dpd1_30",label:"Repayment DPD 1-30",target:.55,weight:.10,actual:b1?.repayment??null,score:scoreKpiDpd1_30(b1?.repayment??null)},{key:"dpd31_90",label:"Repayment DPD 31-90",target:.13,weight:.10,actual:b31?.repayment??null,score:scoreKpiDpd31_90(b31?.repayment??null)},{key:"ntb",label:"Disbursement NTB",target:di?.ntb?.target??null,weight:.25,actual:di?.ntb?.actual??null,score:di?.ntb?.score??null},{key:"etb",label:"Disbursement ETB",target:di?.etb?.target??null,weight:.20,actual:di?.etb?.actual??null,score:di?.etb?.score??null}];const av=m.filter(x=>Number.isFinite(x.score)),weighted=av.reduce((s,x)=>s+x.score*x.weight,0),wa=av.reduce((s,x)=>s+x.weight,0);return{point:pointFilter,metrics:m,weightedScore:weighted,availableWeight:wa,complete:av.length===m.length,buckets:{dpd0:b0,dpd1_30:b1,dpd31_90:b31},disbursement:di};}
+function formatKpiMetricLine(m){const money=m.key==="ntb"||m.key==="etb",t=money?(m.target===null?"N/A":formatMoney(m.target)):formatPct(m.target),a=money?(m.actual===null?"-":formatMoney(m.actual)):formatPct(m.actual),s=Number.isFinite(m.score)?formatPct(m.score):"N/A";return`• ${m.label}: actual ${a} | target ${t} | score ${s} | bobot ${formatPct(m.weight)}`;}
+function answerKpiQuestion(sheet,question,kpSession=null){const q=String(question||"").toLowerCase(),point=sheet?detectPointFromQuestion(question,sheet):null;if(/ranking|per point|point mana|point tertinggi|point terendah/.test(q)&&sheet?.detected?.point){const arr=uniqueValues(sheet,sheet.detected.point).map(p=>({p,k:buildKpiSnapshot(sheet,p,kpSession)})).filter(x=>x.k.availableWeight>0).sort((a,b)=>b.k.weightedScore-a.k.weightedScore).slice(0,10);return`📊 *KPI PER POINT*\n\n${arr.map((x,i)=>`${i+1}. ${x.p}: ${formatPct(x.k.weightedScore)} | bobot tersedia ${formatPct(x.k.availableWeight)}`).join("\n")}\n\nCatatan: NTB/ETB berasal dari KP Daily Area Bangkalan; parameter yang tidak tersedia tidak dianggap 0.`;}
+if(!/(kpi|repayment|ntb|etb|disbursement|dpd)/.test(q))return null;const k=buildKpiSnapshot(sheet||{detected:{},rows:[]},point,kpSession),lines=k.metrics.map(formatKpiMetricLine).join("\n"),total=k.complete?`\n\n*Weighted KPI Score: ${formatPct(k.weightedScore)}*`:`\n\n*Weighted Score tersedia: ${formatPct(k.weightedScore)}*\nBobot parameter tersedia: ${formatPct(k.availableWeight)}\nParameter yang belum dapat dihitung tidak dianggap 0.`;const sourceNote=k.disbursement.available?`\n\n📁 Sumber NTB/ETB: *${k.disbursement.source}* — filter *Area Bangkalan* (${k.disbursement.rowCount.toLocaleString("id-ID")} baris).`:`\n\n⚠️ NTB/ETB: ${k.disbursement.error||"KP Daily belum tersedia."}`;return`🎯 *KPI INTELLIGENCE V5*\n${point?`Point: ${point}`:"Area: Bangkalan untuk NTB/ETB"}\n\n${lines}${total}${sourceNote}`;}
+
+async function processKpDailyUpload(sock,from,msg,caption=""){const document=msg.message?.documentMessage||msg.message?.documentWithCaptionMessage?.message?.documentMessage;if(!document)return false;const filename=document.fileName||"KP Daily";const mime=document.mimetype||"application/octet-stream";if(!isKpDailySourceName(filename)&&!/kp\s*daily/i.test(caption))return false;if(!/\.(xlsx|xls|csv)$/i.test(filename)&&!/spreadsheet|excel|csv/i.test(mime))return false;try{await sock.sendMessage(from,{text:`📊 Marley membaca *${filename}* sebagai sumber *KP Daily*...`});const buffer=await downloadMediaMessage(msg,"buffer",{});const session=await loadSpreadsheetBuffer(buffer,filename);for(const s of session.sheets)s.kpDetected=detectKpDailyColumns(s.columns);kpDailySessions.set(from,session);const sh=activeSheetFor(session),d=sh.kpDetected;const area=d.area?uniqueValues(sh,d.area):[];await sock.sendMessage(from,{text:`✅ *KP Daily berhasil dimuat.*\nSumber: ${filename}\nSheet: ${session.sheets.length}\nArea terdeteksi: ${area.slice(0,10).join(", ")||"-"}\n\nMarley akan mengambil *hanya Area Bangkalan* untuk NTB/ETB.`});}catch(err){console.error("KP Daily upload error:",err);await sock.sendMessage(from,{text:`❌ Marley gagal membaca KP Daily.\n${err.message}`});}return true;}
 
 // ======================================================
 // IDENTITAS BOT
@@ -1992,6 +2014,7 @@ async function startBot() {
               "/analisa - analisis masalah + saran action plan\n" +
               "/proyeksi - hitung proyeksi dari data di chat\n" +
               "/data - status spreadsheet yang sedang dimuat\n" +
+              "Upload file bernama KP Daily - menjadi sumber NTB/ETB (hanya Area Bangkalan)\n" +
               "/grafik - buat grafik payment per point\n" +
               "/grafik tunggakan - grafik tunggakan per point\n" +
               "/statusclosing - status report closing hari ini\n" +
@@ -2005,9 +2028,15 @@ async function startBot() {
               "Marley lupakan: ... - hapus memory\n\n" +
               'Atau sebut nama saya "Marley" diikuti pertanyaan apa saja.',
           });
-        } else if (spreadsheetSessions.has(from) && (!isGroup || isMentioned) && /kpi|repayment|ntb|etb|disbursement|spreadsheet|excel|point mana|ranking|tunggakan|data file|file ini|grafik|loan|payment|dpd/i.test(stripMentions(text))) {
-          await answerSpreadsheetQuestion(sock, from, stripMentions(text));
-          return;
+        } else if ((spreadsheetSessions.has(from) || kpDailySessions.has(from)) && (!isGroup || isMentioned) && /kpi|repayment|ntb|etb|disbursement|spreadsheet|excel|point mana|ranking|tunggakan|data file|file ini|grafik|loan|payment|dpd/i.test(stripMentions(text))) {
+          const cleanQ=stripMentions(text);
+          if (/kpi|ntb|etb|disbursement/i.test(cleanQ) && kpDailySessions.has(from)) {
+            const ps=spreadsheetSessions.get(from), ks=kpDailySessions.get(from);
+            const sh=ps?activeSheetFor(ps):null;
+            const ka=answerKpiQuestion(sh,cleanQ,ks);
+            if(ka){await sock.sendMessage(from,{text:ka});return;}
+          }
+          if (spreadsheetSessions.has(from)) { await answerSpreadsheetQuestion(sock, from, cleanQ); return; }
         } else if (isGroup && isMentioned) {
           const question =
             stripMentions(text);
