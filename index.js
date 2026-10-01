@@ -2140,6 +2140,13 @@ app.listen(PORT, () => {
   console.log(`Server jalan di port ${PORT}`);
 });
 
-await initMemory();
-await initDailyReports();
-await startBot();
+async function bootstrap() {
+  await initMemory();
+  await initDailyReports();
+  await startBot();
+}
+
+bootstrap().catch((err) => {
+  console.error("BOOTSTRAP ERROR:", err);
+  process.exit(1);
+});
