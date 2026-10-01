@@ -847,77 +847,10 @@ async function processIncomingDailyReport(sock, from, sender, text) {
 
 const spreadsheetSessions = new Map();
 const kpDailySessions = new Map();
-const spreadsheetRestorePromises = new Map();
 const SPREADSHEET_DIR = path.join(__dirname, "data", "spreadsheet_cache");
-const SPREADSHEET_SESSION_DIR = path.join(SPREADSHEET_DIR, "sessions");
 
 async function ensureSpreadsheetDir() {
   await fs.mkdir(SPREADSHEET_DIR, { recursive: true });
-  await fs.mkdir(SPREADSHEET_SESSION_DIR, { recursive: true });
-}
-
-function spreadsheetSessionKey(chatId) {
-  return Buffer.from(String(chatId || ""), "utf8").toString("base64url");
-}
-
-function spreadsheetSessionPaths(chatId) {
-  const key = spreadsheetSessionKey(chatId);
-  return {
-    data: path.join(SPREADSHEET_SESSION_DIR, `${key}.bin`),
-    meta: path.join(SPREADSHEET_SESSION_DIR, `${key}.json`),
-  };
-}
-
-async function persistSpreadsheetSession(chatId, buffer, sourceName) {
-  await ensureSpreadsheetDir();
-  const paths = spreadsheetSessionPaths(chatId);
-  await fs.writeFile(paths.data, buffer);
-  await fs.writeFile(
-    paths.meta,
-    JSON.stringify({
-      chatId: String(chatId),
-      sourceName: String(sourceName || "spreadsheet"),
-      savedAt: new Date().toISOString(),
-      dataFile: path.basename(paths.data),
-    }, null, 2),
-    "utf8"
-  );
-  return paths;
-}
-
-async function restoreSpreadsheetSession(chatId) {
-  if (!chatId) return null;
-  const existing = spreadsheetSessions.get(chatId);
-  if (existing) return existing;
-
-  if (spreadsheetRestorePromises.has(chatId)) {
-    return spreadsheetRestorePromises.get(chatId);
-  }
-
-  const promise = (async () => {
-    try {
-      const paths = spreadsheetSessionPaths(chatId);
-      const [buffer, metaRaw] = await Promise.all([
-        fs.readFile(paths.data),
-        fs.readFile(paths.meta, "utf8"),
-      ]);
-      const meta = JSON.parse(metaRaw);
-      const session = await loadSpreadsheetBuffer(buffer, meta.sourceName || "spreadsheet tersimpan");
-      spreadsheetSessions.set(chatId, session);
-      console.log(`[EXCEL RESTORE] ${chatId} -> ${meta.sourceName || "spreadsheet"} (${session.sheets.reduce((n, sh) => n + sh.rowCount, 0)} rows)`);
-      return session;
-    } catch (err) {
-      if (err?.code !== "ENOENT") {
-        console.warn(`[EXCEL RESTORE] gagal untuk ${chatId}:`, err?.message || err);
-      }
-      return null;
-    } finally {
-      spreadsheetRestorePromises.delete(chatId);
-    }
-  })();
-
-  spreadsheetRestorePromises.set(chatId, promise);
-  return promise;
 }
 
 function normalizeHeader(value) {
@@ -965,7 +898,6 @@ function findColumn(columns, candidates) {
 
 function detectDatasetColumns(columns) {
   return {
-    area: findColumn(columns, ["area", "area_name", "regional_area", "region_area", "nama_area"]),
     point: findColumn(columns, ["branch_name", "point", "point_name", "branch"]),
     bp: findColumn(columns, ["bp_username", "agent_fullname", "bp_name", "bp"]),
     customer: findColumn(columns, ["customer_name", "customer", "mitra_name"]),
@@ -976,12 +908,12 @@ function detectDatasetColumns(columns) {
     installment: findColumn(columns, ["installment_amount"]),
     payment: findColumn(columns, ["total_payment"]),
     paymentMin1x: findColumn(columns, ["payment_min_1x", "total_payment_min_1x"]),
-    loanRestructured: findColumn(columns, ["is_loan_restructured"]),
     arrears: findColumn(columns, ["total_tunggakan"]),
     movement: findColumn(columns, ["movement_label"]),
     loanState: findColumn(columns, ["loan_state"]),
     loanKind: findColumn(columns, ["loan_kind"]),
     group: findColumn(columns, ["group_name"]),
+    restructured: findColumn(columns, ["is_loan_restructured", "loan_restructured", "is_restructured"]),
   };
 }
 
@@ -1184,200 +1116,82 @@ async function loadPublicGoogleSheet(url) {
   return loadSpreadsheetBuffer(buffer, `Google Sheets (${info.id})`);
 }
 
+function detectAutoKpiFileType(filename, caption = "") {
+  const s = `${String(filename || "")} ${String(caption || "")}`.toLowerCase();
+  if (/dpd[\s_-]*1[\s_-]*30|\b1[\s_-]*30\b/.test(s)) return "dpd1_30";
+  if (/\bcur+ent\b|dpd[\s_-]*0|\b0[\s_-]*dpd\b/.test(s)) return "current";
+  return null;
+}
+
+function repaymentBucketForAuto(sheet, pointFilter, minDpd, maxDpd) {
+  const d = sheet.detected || {};
+  if (!d.dpdOld || !d.paymentMin1x) return null;
+  const rows = filterRows(sheet, pointFilter);
+  let total = 0, paid = 0;
+  for (const r of rows) {
+    if (d.restructured && !isNo(r[d.restructured])) continue;
+    const dpd = toNumber(r[d.dpdOld]);
+    if (dpd === null || dpd < minDpd || dpd > maxDpd) continue;
+    total++;
+    if (isYes(r[d.paymentMin1x])) paid++;
+  }
+  return { total, paid, unpaid: total - paid, repayment: total ? paid / total : null };
+}
+
+function formatAutoRepaymentReport(sheet, type) {
+  const minDpd = type === "current" ? 0 : 1;
+  const maxDpd = type === "current" ? 0 : 30;
+  const target = type === "current" ? 0.98 : 0.55;
+  const title = type === "current" ? "REPAYMENT CURRENT / DPD 0 PER POINT" : "REPAYMENT DPD 1–30 PER POINT";
+  const points = uniqueValues(sheet, sheet.detected.point);
+  const results = [];
+  for (const point of points) {
+    const r = repaymentBucketForAuto(sheet, point, minDpd, maxDpd);
+    if (!r || !r.total) continue;
+    const gap = Math.max(0, target - r.repayment);
+    const required = Math.max(0, Math.ceil(target * r.total) - r.paid);
+    results.push({ point, ...r, gap, required });
+  }
+  results.sort((a,b) => a.repayment - b.repayment);
+  const area = repaymentBucketForAuto(sheet, null, minDpd, maxDpd);
+  if (!area || !area.total) return `❌ Data ${type === "current" ? "Current / DPD 0" : "DPD 1–30"} tidak ditemukan.`;
+  const lines = results.map((r,i) => {
+    const status = r.gap > 0 ? `⚠️ Kurang ${formatPct(r.gap)} | Tambahan min. ${formatCompactNumber(r.required)} payment` : `✅ Tercapai | Lebih ${formatPct(r.repayment - target)}`;
+    return `${i+1}. *${r.point}* — ${formatCompactNumber(r.paid)}/${formatCompactNumber(r.total)} = *${formatPct(r.repayment)}* | ${status}`;
+  });
+  const areaGap = Math.max(0, target - area.repayment);
+  const areaRequired = Math.max(0, Math.ceil(target * area.total) - area.paid);
+  const areaStatus = areaGap > 0 ? `⚠️ Kurang ${formatPct(areaGap)} | Tambahan min. ${formatCompactNumber(areaRequired)} payment` : `✅ Tercapai | Lebih ${formatPct(area.repayment - target)}`;
+  return `⚡ *${title}*\nTarget KPI: *${formatPct(target)}*\n\n${lines.join("\n")}\n\n*TOTAL AREA*\n${formatCompactNumber(area.paid)}/${formatCompactNumber(area.total)} = *${formatPct(area.repayment)}* | ${areaStatus}`;
+}
+
 async function processSpreadsheetUpload(sock, from, msg, caption = "") {
   const document = msg.message?.documentMessage || msg.message?.documentWithCaptionMessage?.message?.documentMessage;
   if (!document) return false;
   const isGroup = from.endsWith("@g.us");
   const filename = document.fileName || "spreadsheet";
-  const autoFileType = getAutoRepaymentFileType(filename);
-  const captionType = getAutoRepaymentFileType(caption);
-  // File Current / DPD 1-30 boleh diproses otomatis tanpa mengetik "Marley".
-  // Caption juga dapat dipakai sebagai trigger: "current", "dpd 0", "1-30", dll.
-  // File spreadsheet lain di grup tetap membutuhkan trigger agar Marley tidak terlalu banyak bicara.
-  const allowedCaption =
-    !isGroup ||
-    containsBotTrigger(caption) ||
-    /^\s*\/excel\b/i.test(caption) ||
-    Boolean(autoFileType) ||
-    Boolean(captionType);
-  if (!allowedCaption) return false;
   const mime = document.mimetype || "application/octet-stream";
   if (!/\.(xlsx|xls|csv)$/i.test(filename) && !/spreadsheet|excel|csv/i.test(mime)) return false;
+  const autoKpiType = detectAutoKpiFileType(filename, caption);
+  const allowedCaption = !isGroup || autoKpiType || containsBotTrigger(caption) || /^\s*\/excel\b/i.test(caption);
+  if (!allowedCaption) return false;
   if (isKpDailySourceName(filename) || /kp\s*daily/i.test(caption)) return processKpDailyUpload(sock, from, msg, caption);
   try {
     await sock.sendMessage(from, { text: `📊 Marley sedang membaca *${filename}*...` });
     const buffer = await downloadMediaMessage(msg, "buffer", {});
     const session = await loadSpreadsheetBuffer(buffer, filename);
     spreadsheetSessions.set(from, session);
-    const autoType = autoFileType || captionType || inferAutoRepaymentFileType(activeSheetFor(session));
-    await persistSpreadsheetSession(from, buffer, filename);
-    console.log(`[EXCEL SAVED] ${from} -> ${filename}`);
-
-    if (autoType) {
+    if (autoKpiType) {
       const sheet = activeSheetFor(session);
-      const areaFilter = sheet?.detected?.area ? "bangkalan" : null;
-      const analysis = buildAutoRepaymentAnalysis(sheet, autoType, areaFilter);
-      if (analysis) {
-        await sock.sendMessage(from, { text: analysis });
-      } else {
-        await sock.sendMessage(from, {
-          text: `⚠️ File *${filename}* sudah terbaca, tetapi kolom yang dibutuhkan untuk analisis otomatis belum ditemukan.\n\nMarley membutuhkan: Point, DPD Old, Payment Min 1x, dan is_loan_restructured.`
-        });
-      }
+      await sock.sendMessage(from, { text: formatAutoRepaymentReport(sheet, autoKpiType) });
     } else {
-      await sock.sendMessage(from, { text: `✅ Spreadsheet berhasil dibaca dan disimpan.\n\n${listSpreadsheetStatus(session)}\n\nMarley siap menganalisa *file ini saja*.` });
+      await sock.sendMessage(from, { text: `✅ Spreadsheet berhasil dibaca.\n\n${listSpreadsheetStatus(session)}\n\nMarley siap menganalisa *file ini saja*.\nContoh: *Marley, analisa repayment*` });
     }
   } catch (err) {
     console.error("Spreadsheet upload error:", err);
     await sock.sendMessage(from, { text: `❌ Marley gagal membaca spreadsheet.\n${err.message}` });
   }
   return true;
-}
-
-function isRestructuredNo(row, detected) {
-  // KPI hanya menghitung loan dengan is_loan_restructured = NO.
-  // Jika kolom tidak ada, jangan diam-diam membuang data; caller akan memberi catatan.
-  if (!detected?.loanRestructured) return true;
-  return String(row[detected.loanRestructured] ?? "").trim().toLowerCase() === "no";
-}
-
-function getAutoRepaymentFileType(value = "") {
-  const name = String(value || "").toLowerCase().trim();
-  if (!name) return null;
-  if (/kp\s*daily|kp_daily|kpdaily/.test(name)) return null;
-
-  // DPD 1-30: menerima beberapa format nama file/caption.
-  if (/dpd\s*1\s*[-–—]?\s*30|dpd[_\s-]*1[_\s-]*30|(^|[^0-9])1\s*[-–—]\s*30([^0-9]|$)/.test(name)) {
-    return "dpd1_30";
-  }
-
-  // Current / DPD 0: sengaja menerima typo "curent" yang umum muncul
-  // pada nama file export, selain current/curr/current loan/dpd 0.
-  if (/\bcurrent\b|\bcurent\b|current[_\s-]*loan|curr[_\s-]*loan|dpd\s*0|dpd[_\s-]*0/.test(name)) {
-    return "current";
-  }
-
-  return null;
-}
-
-function fastRepaymentByPoint(sheet, minDpd, maxDpd, target, areaFilter = null) {
-  const d = sheet?.detected || {};
-  if (!sheet || !d.point || !d.dpdOld || !d.paymentMin1x) return null;
-
-  const targetArea = areaFilter ? String(areaFilter).trim().toLowerCase() : null;
-  const byPoint = new Map();
-  let eligibleRows = 0;
-  let excludedRestructured = 0;
-
-  // SINGLE PASS: semua baris dibaca sekali.
-  for (const r of sheet.rows) {
-    if (targetArea && d.area) {
-      const area = String(r[d.area] ?? "").trim().toLowerCase();
-      if (area !== targetArea && !area.includes(targetArea)) continue;
-    }
-
-    if (!isRestructuredNo(r, d)) {
-      excludedRestructured++;
-      continue;
-    }
-
-    const dpd = toNumber(r[d.dpdOld]);
-    if (dpd === null || dpd < minDpd || dpd > maxDpd) continue;
-
-    const point = String(r[d.point] ?? "").trim();
-    if (!point) continue;
-    eligibleRows++;
-
-    let item = byPoint.get(point);
-    if (!item) {
-      item = { point, total: 0, paid: 0 };
-      byPoint.set(point, item);
-    }
-    item.total += 1;
-    if (isYes(r[d.paymentMin1x])) item.paid += 1;
-  }
-
-  const rows = [...byPoint.values()].map((item) => {
-    const achievement = item.total ? item.paid / item.total : 0;
-    const gap = Math.max(0, target - achievement);
-    const additionalNeeded = Math.max(0, Math.ceil(target * item.total - item.paid));
-    return { ...item, achievement, gap, additionalNeeded, reached: achievement >= target };
-  });
-
-  rows.sort((a, b) => a.achievement - b.achievement || b.total - a.total);
-  return {
-    rows, target, minDpd, maxDpd, areaFilter: targetArea,
-    scannedRows: sheet.rows.length, eligibleRows, excludedRestructured,
-    restructureColumn: d.loanRestructured || null,
-  };
-}
-
-function formatAutoRepayment(result, label) {
-  if (!result?.rows?.length) return `⚠️ Tidak ditemukan data *${label}* per point pada file ini.`;
-  const lines = result.rows.map((r, i) => {
-    const status = r.reached ? "✅ TERCAPAI" : `⚠️ Kurang ${formatPct(r.gap)}`;
-    const extra = r.reached ? "" : ` | Tambahan min. ${formatCompactNumber(r.additionalNeeded)} payment`;
-    return `${i + 1}. *${r.point}* — ${formatCompactNumber(r.paid)}/${formatCompactNumber(r.total)} = *${formatPct(r.achievement)}* | ${status}${extra}`;
-  });
-  const total = result.rows.reduce((a, r) => ({ total: a.total + r.total, paid: a.paid + r.paid }), { total: 0, paid: 0 });
-  const overall = total.total ? total.paid / total.total : 0;
-  const overallGap = Math.max(0, result.target - overall);
-  return `⚡ *${label} PER POINT*\nTarget KPI: *${formatPct(result.target)}*\n\n${lines.join("\n")}\n\n*TOTAL AREA*\n${formatCompactNumber(total.paid)}/${formatCompactNumber(total.total)} = *${formatPct(overall)}* | ${overall >= result.target ? "✅ TERCAPAI" : `⚠️ Kurang ${formatPct(overallGap)}`}`;
-}
-
-function inferAutoRepaymentFileType(sheet) {
-  const d = sheet?.detected || {};
-  if (!sheet || !d.dpdOld) return null;
-  let current = 0;
-  let dpd1_30 = 0;
-  for (const r of sheet.rows) {
-    if (d.loanRestructured && String(r[d.loanRestructured] ?? "").trim().toLowerCase() !== "no") continue;
-    const dpd = toNumber(r[d.dpdOld]);
-    if (dpd === 0) current++;
-    else if (dpd >= 1 && dpd <= 30) dpd1_30++;
-  }
-  if (current === 0 && dpd1_30 === 0) return null;
-  return current >= dpd1_30 ? "current" : "dpd1_30";
-}
-
-function buildAutoRepaymentAnalysis(sheet, fileType, areaFilter = "bangkalan") {
-  if (!sheet) return null;
-  const isCurrent = fileType === "current";
-  const result = fastRepaymentByPoint(
-    sheet,
-    isCurrent ? 0 : 1,
-    isCurrent ? 0 : 30,
-    isCurrent ? 0.98 : 0.55,
-    areaFilter
-  );
-  if (!result) return null;
-  return formatAutoRepayment(result, isCurrent ? "REPAYMENT CURRENT / DPD 0" : "REPAYMENT DPD 1–30");
-}
-
-function fastRepaymentTargetByPoint(sheet, minDpd, maxDpd, target, areaFilter = null) {
-  return fastRepaymentByPoint(sheet, minDpd, maxDpd, target, areaFilter);
-}
-
-function isRepayment55Question(question) {
-  const q = String(question || "").toLowerCase();
-  const hasPayment = /1\s*x\s*payment|1x\s*payment|payment\s*1x|payment\s*min\s*1x|repayment/.test(q);
-  const hasTarget = /55\s*%|target\s*55|kekurangan.*target|gap.*55|kurang.*55/.test(q);
-  const hasPoint = /masing.?masing\s*point|per\s*point|tiap\s*point|setiap\s*point|point/.test(q);
-  return hasPayment && hasTarget && hasPoint;
-}
-
-function formatFastRepayment55(result) {
-  if (!result?.rows?.length) return "⚠️ Tidak ditemukan data DPD 1–30 per point pada file ini.";
-  const lines = result.rows.map((r, i) => {
-    const status = r.reached ? "✅ TERCAPAI" : `⚠️ Kurang ${formatPct(r.gap)}`;
-    const extra = r.reached ? "" : ` | Tambahan min. ${formatCompactNumber(r.additionalNeeded)} payment`;
-    return `${i + 1}. *${r.point}* — ${formatCompactNumber(r.paid)}/${formatCompactNumber(r.total)} = *${formatPct(r.achievement)}* | ${status}${extra}`;
-  });
-  const total = result.rows.reduce((a, r) => ({ total: a.total + r.total, paid: a.paid + r.paid }), { total: 0, paid: 0 });
-  const overall = total.total ? total.paid / total.total : 0;
-  const overallGap = Math.max(0, result.target - overall);
-
-  return `⚡ *REPAYMENT DPD 1–30 PER POINT*\nTarget KPI: *${formatPct(result.target)}*\n\n${lines.join("\n")}\n\n*TOTAL AREA*\n${formatCompactNumber(total.paid)}/${formatCompactNumber(total.total)} = *${formatPct(overall)}* | ${overall >= result.target ? "✅ TERCAPAI" : `⚠️ Kurang ${formatPct(overallGap)}`}`;
 }
 
 function answerDataQuestion(sheet, question) {
@@ -1417,21 +1231,10 @@ function answerDataQuestion(sheet, question) {
 }
 
 async function answerSpreadsheetQuestion(sock, from, question) {
-  const session = spreadsheetSessions.get(from) || await restoreSpreadsheetSession(from);
-  if (!session) { await sock.sendMessage(from, { text: "❌ File Excel belum tersedia untuk chat ini. Silakan kirim/upload kembali file Excel yang mau dianalisis." }); return; }
+  const session = spreadsheetSessions.get(from);
+  if (!session) { await sock.sendMessage(from, { text: "Belum ada spreadsheet yang dimuat di percakapan ini. Kirim Excel/CSV atau link Google Sheets terlebih dahulu." }); return; }
   const sheet = activeSheetFor(session);
   const q=String(question).trim();
-
-  if (isRepayment55Question(q)) {
-    const areaMentioned = /\bbangkalan\b/i.test(q) ? "bangkalan" : null;
-    const fast = fastRepaymentTargetByPoint(sheet, 1, 30, 0.55, areaMentioned);
-    if (!fast) {
-      await sock.sendMessage(from, { text: "❌ Kolom yang dibutuhkan belum ditemukan. Marley membutuhkan Point, DPD Old, dan Payment Min 1x." });
-      return;
-    }
-    await sock.sendMessage(from, { text: formatFastRepayment55(fast) });
-    return;
-  }
   const kpiAnswer=answerKpiQuestion(sheet,q);
   if(kpiAnswer){await sock.sendMessage(from,{text:kpiAnswer});return;}
   if (/^(sheet|sheets|data|excel|spreadsheet)\b/i.test(q) || /isi file|struktur file|kolom apa/i.test(q)) {
@@ -1458,7 +1261,7 @@ async function processSpreadsheetLink(sock, from, text) {
   if(!urlMatch)return false;
   const isGroup=from.endsWith("@g.us");
   if(isGroup&&!containsBotTrigger(text))return false;
-  try{await sock.sendMessage(from,{text:"🔗 Marley sedang membaca Google Sheets..."});const info=extractGoogleSheetInfo(urlMatch[0]);const exportUrl=`https://docs.google.com/spreadsheets/d/${info.id}/export?format=xlsx${info.gid?`&gid=${info.gid}`:""}`;const response=await fetch(exportUrl,{redirect:"follow"});if(!response.ok)throw new Error(`Google Sheets mengembalikan HTTP ${response.status}.`);const buffer=Buffer.from(await response.arrayBuffer());const session=await loadSpreadsheetBuffer(buffer,`Google Sheets (${info.id})`);spreadsheetSessions.set(from,session);await persistSpreadsheetSession(from,buffer,`Google Sheets (${info.id})`);await sock.sendMessage(from,{text:`✅ Google Sheets berhasil dimuat dan disimpan.\n\n${listSpreadsheetStatus(session)}\n\nMarley siap menganalisa *sheet ini saja*.`});}
+  try{await sock.sendMessage(from,{text:"🔗 Marley sedang membaca Google Sheets..."});const session=await loadPublicGoogleSheet(urlMatch[0]);spreadsheetSessions.set(from,session);await sock.sendMessage(from,{text:`✅ Google Sheets berhasil dimuat.\n\n${listSpreadsheetStatus(session)}\n\nMarley siap menganalisa *sheet ini saja*.`});}
   catch(err){await sock.sendMessage(from,{text:`❌ Tidak bisa membaca Google Sheets.\n${err.message}\n\nJika sheet private, upload Excel-nya ke WhatsApp atau buat akses Viewer via link.`});}
   return true;
 }
@@ -1494,7 +1297,7 @@ function scoreKpiDpd0(r){if(!Number.isFinite(r))return null;if(r<.90)return 0;if
 function scoreKpiDpd1_30(r){if(!Number.isFinite(r))return null;if(r<=KPI_CONFIG.dpd1_30.target)return r/KPI_CONFIG.dpd1_30.target;if(r<=.65)return 1.20;return 1.30;}
 function scoreKpiDpd31_90(r){if(!Number.isFinite(r))return null;if(r<=KPI_CONFIG.dpd31_90.target)return r/KPI_CONFIG.dpd31_90.target;if(r<=.20)return 1.20;return 1.30;}
 
-function kpiRepaymentBucket(sheet,pointFilter,minDpd,maxDpd){const d=sheet.detected;if(!d.dpdOld||!d.paymentMin1x)return null;const rows=filterRows(sheet,pointFilter);let total=0,paid=0,paymentAmount=0,os=0,arrears=0;for(const r of rows){const dpd=toNumber(r[d.dpdOld]);if(dpd===null||dpd<minDpd||dpd>maxDpd)continue;total++;if(isYes(r[d.paymentMin1x]))paid++;if(d.payment)paymentAmount+=toNumber(r[d.payment])||0;if(d.osNew)os+=toNumber(r[d.osNew])||0;if(d.arrears)arrears+=toNumber(r[d.arrears])||0;}return{total,paid,unpaid:total-paid,repayment:total?paid/total:null,paymentAmount,os,arrears};}
+function kpiRepaymentBucket(sheet,pointFilter,minDpd,maxDpd){const d=sheet.detected;if(!d.dpdOld||!d.paymentMin1x)return null;const rows=filterRows(sheet,pointFilter);let total=0,paid=0,paymentAmount=0,os=0,arrears=0;for(const r of rows){if(d.restructured && !isNo(r[d.restructured]))continue;const dpd=toNumber(r[d.dpdOld]);if(dpd===null||dpd<minDpd||dpd>maxDpd)continue;total++;if(isYes(r[d.paymentMin1x]))paid++;if(d.payment)paymentAmount+=toNumber(r[d.payment])||0;if(d.osNew)os+=toNumber(r[d.osNew])||0;if(d.arrears)arrears+=toNumber(r[d.arrears])||0;}return{total,paid,unpaid:total-paid,repayment:total?paid/total:null,paymentAmount,os,arrears};}
 
 function isKpDailySourceName(name){return /kp\s*daily|kp_daily|kpdaily/i.test(String(name||""));}
 function isApprovalStatus(value){const s=String(value??"").trim().toLowerCase();if(!s)return true;return /approve|approved|approval|disetujui|setuju|lolos|approved\s*\/\s*approve/i.test(s);}
@@ -2349,26 +2152,15 @@ async function startBot() {
               "Marley lupakan: ... - hapus memory\n\n" +
               'Atau sebut nama saya "Marley" diikuti pertanyaan apa saja.',
           });
-        } else if ((!isGroup || isMentioned) && /kpi|repayment|ntb|etb|disbursement|spreadsheet|excel|point mana|ranking|tunggakan|data file|file ini|grafik|loan|payment|dpd/i.test(stripMentions(text))) {
+        } else if ((spreadsheetSessions.has(from) || kpDailySessions.has(from)) && (!isGroup || isMentioned) && /kpi|repayment|ntb|etb|disbursement|spreadsheet|excel|point mana|ranking|tunggakan|data file|file ini|grafik|loan|payment|dpd/i.test(stripMentions(text))) {
           const cleanQ=stripMentions(text);
-          // Pulihkan file Excel dari disk sebelum menentukan apakah session tersedia.
-          // Ini membuat Excel tetap tersedia setelah Railway restart/redeploy (selama /app/data dipersistenkan).
-          if (!spreadsheetSessions.has(from)) {
-            await restoreSpreadsheetSession(from);
-          }
-          const hasSpreadsheet = spreadsheetSessions.has(from);
-          const hasKpDaily = kpDailySessions.has(from);
-          if (!hasSpreadsheet && !hasKpDaily) {
-            await sock.sendMessage(from, { text: "❌ File Excel belum tersedia untuk chat ini. Silakan kirim/upload file Excel yang mau dianalisis terlebih dahulu." });
-            return;
-          }
           if (/kpi|ntb|etb|disbursement/i.test(cleanQ) && kpDailySessions.has(from)) {
             const ps=spreadsheetSessions.get(from), ks=kpDailySessions.get(from);
             const sh=ps?activeSheetFor(ps):null;
             const ka=answerKpiQuestion(sh,cleanQ,ks);
             if(ka){await sock.sendMessage(from,{text:ka});return;}
           }
-          if (hasSpreadsheet) { await answerSpreadsheetQuestion(sock, from, cleanQ); return; }
+          if (spreadsheetSessions.has(from)) { await answerSpreadsheetQuestion(sock, from, cleanQ); return; }
         } else if (isGroup && isMentioned) {
           const question =
             stripMentions(text);
