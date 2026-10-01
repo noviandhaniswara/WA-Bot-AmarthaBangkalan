@@ -1123,10 +1123,20 @@ function detectAutoKpiFileType(filename, caption = "") {
   return null;
 }
 
+function bangkalanRowsForAuto(sheet) {
+  const d = sheet.detected || {};
+  if (!d.area) return null;
+  return (sheet.rows || []).filter((r) => normalizeArea(r[d.area]) === "bangkalan");
+}
+
 function repaymentBucketForAuto(sheet, pointFilter, minDpd, maxDpd) {
   const d = sheet.detected || {};
-  if (!d.dpdOld || !d.paymentMin1x) return null;
-  const rows = filterRows(sheet, pointFilter);
+  if (!d.dpdOld || !d.paymentMin1x || !d.area) return null;
+  const bangkalanRows = bangkalanRowsForAuto(sheet);
+  if (!bangkalanRows) return null;
+  const rows = pointFilter == null
+    ? bangkalanRows
+    : bangkalanRows.filter((r) => String(r[d.point] ?? "").trim() === String(pointFilter).trim());
   let total = 0, paid = 0;
   for (const r of rows) {
     if (d.restructured && !isNo(r[d.restructured])) continue;
@@ -1143,7 +1153,11 @@ function formatAutoRepaymentReport(sheet, type) {
   const maxDpd = type === "current" ? 0 : 30;
   const target = type === "current" ? 0.98 : 0.55;
   const title = type === "current" ? "REPAYMENT CURRENT / DPD 0 PER POINT" : "REPAYMENT DPD 1–30 PER POINT";
-  const points = uniqueValues(sheet, sheet.detected.point);
+  if (!sheet.detected?.area) return "❌ Kolom area tidak ditemukan, jadi Marley tidak dapat memastikan filter Area Bangkalan.";
+  if (!sheet.detected?.point) return "❌ Kolom point tidak ditemukan.";
+  const bangkalanRows = bangkalanRowsForAuto(sheet);
+  if (!bangkalanRows?.length) return "❌ Tidak ditemukan data Area Bangkalan pada file ini.";
+  const points = uniqueValues({ ...sheet, rows: bangkalanRows }, sheet.detected.point);
   const results = [];
   for (const point of points) {
     const r = repaymentBucketForAuto(sheet, point, minDpd, maxDpd);
