@@ -1573,12 +1573,9 @@ async function resolveMentionedUsers(sock, groupId, mentionedJids = []) {
 
     return mentionedJids.map((jid) => {
       const cleanJid = normalizeJid(jid);
-      const participant = participants.find((p) => {
-        const candidateJids = [p.id, p.jid, p.lid]
-          .filter(Boolean)
-          .map(normalizeJid);
-        return candidateJids.includes(cleanJid);
-      });
+      const participant = participants.find(
+        (p) => normalizeJid(p.id || p.jid || p.lid) === cleanJid
+      );
 
       const displayName =
         participant?.notify ||
@@ -1587,16 +1584,7 @@ async function resolveMentionedUsers(sock, groupId, mentionedJids = []) {
         participant?.shortName ||
         cleanJid.split("@")[0];
 
-      const participantJids = participant
-        ? [participant.id, participant.jid, participant.lid].filter(Boolean).map(normalizeJid)
-        : [];
-
-      const isBot = !!botJid && participantJids.some((candidate) => {
-        const number = candidate.split("@")[0].split(":")[0];
-        return number === String(botJid).split("@")[0].split(":")[0];
-      });
-
-      return { jid: cleanJid, name: displayName, isBot };
+      return { jid: cleanJid, name: displayName };
     });
   } catch (err) {
     console.warn("Gagal membaca metadata mention grup:", err?.message || err);
@@ -1612,6 +1600,82 @@ function formatMentionContext(mentionedUsers = []) {
   return mentionedUsers
     .map((u) => `- ${u.name} (${u.jid})`)
     .join("\n");
+}
+
+// Membaca pesan yang sedang di-REPLY/QUOTE di WhatsApp.
+// Baileys menyimpan pesan yang direply di contextInfo.quotedMessage.
+function unwrapMessage(message) {
+  let current = message;
+  for (let i = 0; i < 5 && current; i += 1) {
+    if (current.ephemeralMessage?.message) {
+      current = current.ephemeralMessage.message;
+      continue;
+    }
+    if (current.viewOnceMessage?.message) {
+      current = current.viewOnceMessage.message;
+      continue;
+    }
+    if (current.viewOnceMessageV2?.message) {
+      current = current.viewOnceMessageV2.message;
+      continue;
+    }
+    if (current.documentWithCaptionMessage?.message) {
+      current = current.documentWithCaptionMessage.message;
+      continue;
+    }
+    break;
+  }
+  return current || {};
+}
+
+function extractQuotedMessageInfo(msg) {
+  const currentMessage = unwrapMessage(msg?.message);
+  const contextInfo =
+    currentMessage.extendedTextMessage?.contextInfo ||
+    currentMessage.imageMessage?.contextInfo ||
+    currentMessage.videoMessage?.contextInfo ||
+    currentMessage.documentMessage?.contextInfo ||
+    currentMessage.audioMessage?.contextInfo ||
+    {};
+
+  const quotedMessage = unwrapMessage(contextInfo.quotedMessage);
+  if (!contextInfo.quotedMessage || !Object.keys(quotedMessage).length) {
+    return null;
+  }
+
+  const quotedText =
+    quotedMessage.conversation ||
+    quotedMessage.extendedTextMessage?.text ||
+    quotedMessage.imageMessage?.caption ||
+    quotedMessage.videoMessage?.caption ||
+    quotedMessage.documentMessage?.caption ||
+    quotedMessage.documentWithCaptionMessage?.message?.documentMessage?.caption ||
+    "";
+
+  const participant =
+    contextInfo.participant ||
+    contextInfo.remoteJid ||
+    "pengirim pesan sebelumnya";
+
+  return {
+    text: quotedText,
+    participant,
+    stanzaId: contextInfo.stanzaId || null,
+  };
+}
+
+function formatQuotedContext(quotedInfo) {
+  if (!quotedInfo) return "";
+
+  const quotedText = quotedInfo.text?.trim()
+    ? quotedInfo.text.trim()
+    : "[Pesan media/dokumen yang tidak memiliki teks/caption]";
+
+  return (
+    `PESAN YANG SEDANG DI-REPLY/QUOTE:\n` +
+    `Pengirim: ${quotedInfo.participant}\n` +
+    `Isi pesan: ${quotedText}`
+  );
 }
 
 // ======================================================
@@ -1719,12 +1783,16 @@ async function startBot() {
       const mentionedUsers =
         await resolveMentionedUsers(sock, from, mentionedJids);
 
+      // Jika user membalas/quote pesan lain, baca isi pesan yang di-quote.
+      const quotedInfo = extractQuotedMessageInfo(msg);
+
       const textTrigger = containsBotTrigger(text);
 
       const officialMention =
-        !!botJid &&
-        (mentionedUsers.some((u) => u.isBot) ||
-          mentionedJids.some((jid) => String(jid).includes(String(botJid))));
+        botJid &&
+        mentionedJids.some((jid) =>
+          jid.includes(botJid)
+        );
 
       const isMentioned =
         isGroup &&
@@ -1736,7 +1804,6 @@ async function startBot() {
         console.log("text:", JSON.stringify(text));
         console.log("botJid:", botJid);
         console.log("mentionedJids:", mentionedJids);
-        console.log("mentionedUsers:", mentionedUsers);
         console.log("textTrigger:", textTrigger);
         console.log("officialMention:", officialMention);
         console.log("isMentioned:", isMentioned);
@@ -2136,11 +2203,13 @@ async function startBot() {
 
           const historyContext = formatHistory(from);
           const mentionContext = formatMentionContext(mentionedUsers);
+          const quotedContext = formatQuotedContext(quotedInfo);
           const context = [
             historyContext,
             mentionContext
               ? `ORANG YANG DI-TAG PADA PESAN INI:\n${mentionContext}`
               : "",
+            quotedContext,
           ]
             .filter(Boolean)
             .join("\n\n");
