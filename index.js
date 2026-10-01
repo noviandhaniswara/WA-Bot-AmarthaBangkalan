@@ -1723,7 +1723,18 @@ async function startBot() {
       const msg = messages[0];
 
       if (!msg?.message) return;
-      if (msg.key.fromMe) return;
+
+      // Pesan biasa dari akun bot sendiri diabaikan untuk mencegah loop.
+      // Tetapi file Excel/CSV Current atau DPD 1-30 yang dikirim dari akun
+      // yang sama tetap harus diproses karena user memang mengirim file dari nomor Marley.
+      const ownDocument =
+        msg.message.documentMessage ||
+        msg.message.documentWithCaptionMessage?.message?.documentMessage;
+      const ownDocumentName = ownDocument?.fileName || "";
+      const ownSpreadsheet =
+        !!ownDocument && /\.(xlsx|xls|csv)$/i.test(ownDocumentName);
+
+      if (msg.key.fromMe && !ownSpreadsheet) return;
 
       const from = msg.key.remoteJid;
       if (!from) return;
