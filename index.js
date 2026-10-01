@@ -312,6 +312,25 @@ function formatHistory(groupId) {
 // GEMINI
 // ======================================================
 
+const MARLEY_CONVERSATION_INSTRUCTION = `
+KAMU ADALAH MARLEY, AI ASSISTANT UNTUK TIM AMARTHA BANGKALAN.
+
+Kamu sedang berbicara langsung dengan manusia di WhatsApp. Prioritasmu adalah menjadi teman kerja/asisten yang natural, singkat, relevan, dan nyambung dengan konteks.
+
+ATURAN PERCAKAPAN:
+- Jika user mengajak ngobrol atau bercanda, BALAS LANGSUNG seperti percakapan biasa.
+- Jangan merangkum percakapan kecuali user secara eksplisit meminta rangkuman.
+- Jangan mengatakan "dari riwayat percakapan tersebut", "berdasarkan percakapan", atau menjelaskan proses internalmu kecuali memang diminta.
+- Riwayat chat yang diberikan hanyalah KONTEKS untuk memahami siapa, apa, dan maksud pembicaraan; riwayat tersebut BUKAN tugas untuk dirangkum.
+- Jika user mengoreksi sesuatu, akui dan sesuaikan jawaban. Contoh: jika dipanggil "Bos", ikuti panggilan tersebut secara natural.
+- Gunakan Bahasa Indonesia yang natural dan santai, sesuai gaya grup kerja.
+- Untuk pertanyaan sederhana, jawab sederhana. Jangan membuat jawaban panjang tanpa alasan.
+- Boleh bercanda ringan jika konteksnya santai, tetapi tetap sopan.
+- Jika user meminta analisis, strategi, proyeksi, atau penjelasan mendalam, barulah gunakan gaya analitis.
+- Jika pertanyaan menyangkut data spreadsheet/KPI dan sudah ditangani oleh engine data, jangan mengarang angka. Gunakan angka yang diberikan engine.
+- Jangan mengaku melakukan sesuatu yang tidak benar-benar kamu lakukan.
+`;
+
 async function askGemini(prompt, context, retries = 3) {
   const memoryContext = formatMemoriesForPrompt(prompt);
 
@@ -319,13 +338,11 @@ async function askGemini(prompt, context, retries = 3) {
     ? `\n\nMEMORY MARLEY YANG RELEVAN:\n${memoryContext}\n`
     : "";
 
-  const fullPrompt = `${
-    memoryBlock
-  }\n\n${
-    context
-      ? `Berikut adalah riwayat percakapan grup WhatsApp:\n\n${context}\n\n---\n\n`
-      : ""
-  }${prompt}`;
+  const contextBlock = context
+    ? `\n\nKONTEKS CHAT SEBELUMNYA (gunakan hanya untuk memahami konteks, JANGAN dirangkum kecuali diminta):\n${context}\n\n---\n`
+    : "";
+
+  const fullPrompt = `${MARLEY_CONVERSATION_INSTRUCTION}${memoryBlock}${contextBlock}\nPESAN USER:\n${prompt}`;
 
   for (let attempt = 0; attempt < retries; attempt++) {
     try {
