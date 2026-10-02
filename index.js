@@ -142,6 +142,164 @@ function normalizeForSearch(value) {
     .replace(/[\u0300-\u036f]/g, "");
 }
 
+// ======================================================
+// LOAN MEMORY MARLEY
+// Database awal: Ops Report Penagihan + Leads
+// Primary key: Customer Number
+// ======================================================
+
+const DATA_DIR = process.env.DATA_DIR || "/app/data";
+const LOAN_MEMORY_RUNTIME_FILE = path.join(DATA_DIR, "loan_memory.json");
+const LOAN_MEMORY_ROOT_FILE = path.join(__dirname, "loan_memory.json");
+const LOAN_MEMORY_SEED_FILE = path.join(__dirname, "seed", "loan_memory.json");
+
+let loanMemory = {
+  version: 1,
+  updated_at: null,
+  area_scope: "Bangkalan",
+  primary_key: "customer_number",
+  records: [],
+};
+
+async function initLoanMemory() {
+  try {
+    await fs.mkdir(DATA_DIR, { recursive: true });
+    let sourceFile = LOAN_MEMORY_RUNTIME_FILE;
+    let raw;
+
+    try {
+      raw = await fs.readFile(sourceFile, "utf8");
+    } catch {
+      const candidates = [LOAN_MEMORY_ROOT_FILE, LOAN_MEMORY_SEED_FILE];
+      for (const candidate of candidates) {
+        try {
+          raw = await fs.readFile(candidate, "utf8");
+          sourceFile = candidate;
+          break;
+        } catch {}
+      }
+      if (!raw) throw new Error("File seed loan_memory.json tidak ditemukan.");
+      await fs.writeFile(LOAN_MEMORY_RUNTIME_FILE, raw, "utf8");
+    }
+
+    const parsed = JSON.parse(raw);
+    if (!parsed || !Array.isArray(parsed.records)) {
+      throw new Error("Format loan_memory.json tidak valid.");
+    }
+
+    loanMemory = parsed;
+    console.log(`Loan Memory siap: ${loanMemory.records.length} customer. Sumber: ${sourceFile}`);
+  } catch (err) {
+    console.error("Gagal menyiapkan Loan Memory:", err);
+    loanMemory = { version: 1, updated_at: null, area_scope: "Bangkalan", primary_key: "customer_number", records: [] };
+  }
+}
+
+function normalizeLoanText(value) {
+  return normalizeForSearch(value)
+    .replace(/[^\p{L}\p{N}\s_-]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function loanMatches(record, query) {
+  const q = normalizeLoanText(query);
+  if (!q) return false;
+  const customer = normalizeLoanText(record.customer_number);
+  if (customer === q) return true;
+  const haystack = normalizeLoanText([
+    record.nama_mitra, record.customer_number, record.loan_id, record.majelis,
+    record.majelis_id, record.no_hp, record.bp, record.branch
+  ].filter(Boolean).join(" "));
+  return haystack.includes(q);
+}
+
+function searchLoanMemory(query, limit = 5) {
+  const q = String(query || "").trim();
+  if (!q) return [];
+  const exactNumber = loanMemory.records.find(r => String(r.customer_number || "").trim() === q);
+  if (exactNumber) return [exactNumber];
+  return loanMemory.records.filter(r => loanMatches(r, q)).slice(0, limit);
+}
+
+function formatLoanValue(value, fallback = "-") {
+  return value === null || value === undefined || String(value).trim() === "" ? fallback : String(value);
+}
+
+function formatRupiah(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return formatLoanValue(value);
+  return new Intl.NumberFormat("id-ID", { maximumFractionDigits: 0 }).format(n);
+}
+
+function formatLoanRecord(record) {
+  return [
+    `👤 *${formatLoanValue(record.nama_mitra)}*`,
+    `Customer Number : ${formatLoanValue(record.customer_number)}`,
+    `Loan ID        : ${formatLoanValue(record.loan_id)}`,
+    `Majelis        : ${formatLoanValue(record.majelis)}`,
+    `Majelis ID     : ${formatLoanValue(record.majelis_id)}`,
+    `BP             : ${formatLoanValue(record.bp)}`,
+    `Branch         : ${formatLoanValue(record.branch)}`,
+    `Payment Status : ${formatLoanValue(record.payment_status)}`,
+    `Tunggakan      : Rp ${formatRupiah(record.tunggakan)}`,
+    `Weekly Repay   : Rp ${formatRupiah(record.weekly_repayment)}`,
+    `Outstanding    : Rp ${formatRupiah(record.outstanding)}`,
+    `Latest Payment : ${formatLoanValue(record.latest_payment_date)}`,
+    `Jatuh Tempo    : ${formatLoanValue(record.tanggal_jatuh_tempo)}`,
+    `Home Visit     : ${formatLoanValue(record.tanggal_home_visit)}`,
+    `Status HV      : ${formatLoanValue(record.status_home_visit)}`,
+    `Jadwal Kumpul  : ${formatLoanValue(record.jadwal_kumpulan)}`,
+    `No. HP         : ${formatLoanValue(record.no_hp)}`,
+    `Alamat         : ${formatLoanValue(record.address)}`,
+  ].join("\n");
+}
+
+function parseLoanCommand(text) {
+  const cleaned = stripMentions(String(text || "").trim());
+  const m = cleaned.match(/^\/(?:loan|cari)\s+(.+)$/i);
+  return m ? m[1].trim() : null;
+}
+
+function looksLikeLoanQuestion(text) {
+  const q = normalizeForSearch(stripMentions(text));
+  if (!q) return false;
+  return (
+    /\b(?:cek|cari|lihat|tampilkan|data|profil|info|informasi)\b.*\b(?:loan|mitra|customer|nasabah)\b/i.test(q) ||
+    /\b(?:loan|customer number|nomor customer|id loan|nama mitra|majelis)\b/i.test(q)
+  );
+}
+
+async function answerLoanQuery(sock, from, query) {
+  const results = searchLoanMemory(query, 5);
+  if (!results.length) {
+    await sock.sendMessage(from, {
+      text: `🔎 Loan Memory tidak menemukan data untuk *${query}*.\n\nCoba gunakan Customer Number atau Nama Mitra yang lebih lengkap.`,
+    });
+    return true;
+  }
+
+  if (results.length === 1) {
+    await sock.sendMessage(from, {
+      text: `📋 *DATA LOAN MARLEY*\n\n${formatLoanRecord(results[0])}`,
+    });
+    return true;
+  }
+
+  const lines = results.map((r, i) =>
+    `${i + 1}. *${formatLoanValue(r.nama_mitra)}*\n` +
+    `   Customer Number: ${formatLoanValue(r.customer_number)}\n` +
+    `   Loan ID: ${formatLoanValue(r.loan_id)}\n` +
+    `   Majelis: ${formatLoanValue(r.majelis)}\n` +
+    `   Status: ${formatLoanValue(r.payment_status)}`
+  );
+
+  await sock.sendMessage(from, {
+    text: `🔎 Ditemukan *${results.length} data* untuk *${query}*.\n\n${lines.join("\n\n")}\n\nGunakan Customer Number untuk melihat data yang lebih spesifik.`,
+  });
+  return true;
+}
+
 function getRelevantMemories(query, limit = 12) {
   if (!memories.length) return [];
 
@@ -1998,6 +2156,12 @@ async function startBot() {
         const command =
           text.trim().toLowerCase();
 
+        const loanCommand = parseLoanCommand(text);
+        if (loanCommand) {
+          await answerLoanQuery(sock, from, loanCommand);
+          return;
+        }
+
         if (await processSpreadsheetCommand(sock, from, command)) {
           return;
         } else if (command === "/rangkum") {
@@ -2157,6 +2321,8 @@ async function startBot() {
               "/analisa - analisis masalah + saran action plan\n" +
               "/proyeksi - hitung proyeksi dari data di chat\n" +
               "/data - status spreadsheet yang sedang dimuat\n" +
+              "/loan <Customer Number/Nama Mitra> - cari data loan\n" +
+              "/cari <Customer Number/Nama Mitra> - cari data loan\n" +
               "Upload file bernama KP Daily - menjadi sumber NTB/ETB (hanya Area Bangkalan)\n" +
               "/grafik - buat grafik payment per point\n" +
               "/grafik tunggakan - grafik tunggakan per point\n" +
@@ -2171,6 +2337,12 @@ async function startBot() {
               "Marley lupakan: ... - hapus memory\n\n" +
               'Atau sebut nama saya "Marley" diikuti pertanyaan apa saja.',
           });
+        } else if (
+          looksLikeLoanQuestion(text) &&
+          (!isGroup || isMentioned)
+        ) {
+          await answerLoanQuery(sock, from, stripMentions(text));
+          return;
         } else if ((spreadsheetSessions.has(from) || kpDailySessions.has(from)) && (!isGroup || isMentioned) && /kpi|repayment|ntb|etb|disbursement|spreadsheet|excel|point mana|ranking|tunggakan|data file|file ini|grafik|loan|payment|dpd/i.test(stripMentions(text))) {
           const cleanQ=stripMentions(text);
           if (/kpi|ntb|etb|disbursement/i.test(cleanQ) && kpDailySessions.has(from)) {
@@ -2294,6 +2466,7 @@ app.listen(PORT, () => {
 async function bootstrap() {
   await initMemory();
   await initDailyReports();
+  await initLoanMemory();
   await startBot();
 }
 
