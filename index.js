@@ -264,17 +264,52 @@ function parseLoanCommand(text) {
 function looksLikeLoanQuestion(text) {
   const q = normalizeForSearch(stripMentions(text));
   if (!q) return false;
-  return (
-    /\b(?:cek|cari|lihat|tampilkan|data|profil|info|informasi)\b.*\b(?:loan|mitra|customer|nasabah)\b/i.test(q) ||
-    /\b(?:loan|customer number|nomor customer|id loan|nama mitra|majelis)\b/i.test(q)
-  );
+
+  // Anggap pertanyaan sebagai Loan Memory jika jelas menyebut entitas loan/mitra,
+  // atau jika ada Customer Number yang cukup panjang. Ini diproses sebelum Gemini.
+  const hasLoanKeyword =
+    /\b(?:loan|mitra|nasabah|customer|customer number|nomor customer|id loan|nama mitra|majelis|tunggakan|outstanding|no hp|nomor hp)\b/i.test(q);
+  const hasCustomerNumber = /\b\d{7,12}\b/.test(q);
+  const hasLookupVerb = /\b(?:cek|cari|lihat|tampilkan|data|profil|info|informasi|siapa)\b/i.test(q);
+
+  return hasLoanKeyword || (hasCustomerNumber && hasLookupVerb);
+}
+
+function extractLoanSearchTerm(text) {
+  const raw = stripMentions(String(text || "")).trim();
+  if (!raw) return "";
+
+  // Customer Number selalu diprioritaskan karena merupakan primary key.
+  const customerMatch = raw.match(/\b\d{7,12}\b/);
+  if (customerMatch) return customerMatch[0];
+
+  let q = raw
+    .replace(/^@?marley\b[,:;.!?\-]*\s*/i, "")
+    .replace(/^\s*(?:tolong\s+)?(?:dong\s+)?/i, "")
+    .trim();
+
+  // Bentuk eksplisit: "nama mitra Siti", "customer Siti", "majelis ..."
+  const explicit = q.match(/(?:nama\s+mitra|customer(?:\s+number)?|nomor\s+customer|id\s+loan|loan|majelis)\s*(?:nya|:)?\s+(.+?)(?:\s+(?:dong|ya|yah|please))?$/i);
+  if (explicit?.[1]) {
+    return explicit[1].trim().replace(/[?.!,]+$/, "").trim();
+  }
+
+  // Bentuk umum: "cek/cari/data/profil mitra Siti".
+  const generic = q.match(/(?:cek|cari|lihat|tampilkan|data|profil|info|informasi|siapa)\s+(?:data\s+)?(?:loan|mitra|nasabah|customer)?\s*(?:nya|:)?\s*(.+)$/i);
+  if (generic?.[1]) {
+    const candidate = generic[1].trim().replace(/[?.!,]+$/, "").trim();
+    if (candidate && !/^(?:loan|mitra|nasabah|customer)$/i.test(candidate)) return candidate;
+  }
+
+  return q.replace(/[?.!,]+$/, "").trim();
 }
 
 async function answerLoanQuery(sock, from, query) {
-  const results = searchLoanMemory(query, 5);
+  const searchTerm = extractLoanSearchTerm(query);
+  const results = searchLoanMemory(searchTerm, 5);
   if (!results.length) {
     await sock.sendMessage(from, {
-      text: `🔎 Loan Memory tidak menemukan data untuk *${query}*.\n\nCoba gunakan Customer Number atau Nama Mitra yang lebih lengkap.`,
+      text: `🔎 Loan Memory tidak menemukan data untuk *${searchTerm || query}*.\n\nCoba gunakan Customer Number atau Nama Mitra yang lebih lengkap.`,
     });
     return true;
   }
@@ -295,7 +330,7 @@ async function answerLoanQuery(sock, from, query) {
   );
 
   await sock.sendMessage(from, {
-    text: `🔎 Ditemukan *${results.length} data* untuk *${query}*.\n\n${lines.join("\n\n")}\n\nGunakan Customer Number untuk melihat data yang lebih spesifik.`,
+    text: `🔎 Ditemukan *${results.length} data* untuk *${searchTerm || query}*.\n\n${lines.join("\n\n")}\n\nGunakan Customer Number untuk melihat data yang lebih spesifik.`,
   });
   return true;
 }
