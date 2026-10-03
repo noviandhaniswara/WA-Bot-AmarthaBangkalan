@@ -1403,7 +1403,7 @@ function pqiPointData(state, pointFilter = null) {
   const currentSheet = firstSheetFromSession(autoState.current);
   const dpd3190 = dpd3190Sessions.get(state.from);
   const sheet3160 = firstSheetFromSession(dpd3190?.dpd31_60);
-  const sheet130 = state.sheet130;
+  const sheet130 = firstSheetFromSession(autoState.dpd1_30);
   if (!currentSheet || !sheet130 || !sheet3160) return null;
 
   const current = pqiBucketFromSheet(currentSheet, pointFilter, 0, 0);
