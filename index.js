@@ -2445,152 +2445,106 @@ async function startBot() {
   );
 }
 
-
 // ======================================================
-// MARLEY PORTFOLIO CONTROL TOWER DASHBOARD
+// PORTFOLIO CONTROL TOWER DASHBOARD
 // ======================================================
 
-function dashboardBucketForLoan(loan) {
-  const d = Number(loan?.dpdOld);
-  if (!Number.isFinite(d) || d <= 0) return "current";
-  if (d <= 30) return "1-30";
-  if (d <= 90) return "31-90";
-  return "other";
+function dashboardTokenOk(req) {
+  const expected = String(process.env.DASHBOARD_TOKEN || "").trim();
+  if (!expected) return true;
+  const supplied = String(req.query.token || req.headers["x-dashboard-token"] || "").trim();
+  return supplied === expected;
 }
 
-function dashboardLoanEligible(loan) {
-  if (!portfolioAreaIsBangkalan(loan?.area)) return false;
-  if (String(loan?.status || "").toUpperCase() !== "ACTIVE") return false;
-  if (String(loan?.isLoanRestructured || "").trim().toUpperCase() === "YES") return false;
-  return dashboardBucketForLoan(loan) !== "other";
-}
-
-function dashboardPaid(loan) {
-  return isYes(loan?.paymentMin1x);
-}
-
-function dashboardTarget(bucket) {
-  if (bucket === "current") return 0.98;
-  if (bucket === "1-30") return 0.55;
-  if (bucket === "31-90") return 0.13;
+function portfolioDashboardBucket(loan) {
+  const dpd = Number(loan?.dpdOld ?? loan?.dpdNew);
+  if (!Number.isFinite(dpd)) return null;
+  if (dpd <= 0) return "current";
+  if (dpd <= 30) return "1-30";
+  if (dpd <= 90) return "31-90";
   return null;
 }
 
-function dashboardAggregate(loans, bucket = "all") {
-  const selected = loans.filter((x) => bucket === "all" || dashboardBucketForLoan(x) === bucket);
-  const paid = selected.filter(dashboardPaid).length;
-  const unpaid = selected.length - paid;
-  const os = selected.reduce((n, x) => n + (Number(x.osNew) || 0), 0);
-  const customers = new Set(selected.map((x) => x.customerNumber).filter(Boolean)).size;
-  const repayment = selected.length ? paid / selected.length : 0;
-  const target = dashboardTarget(bucket);
-  return {
-    loans: selected.length,
-    paid,
-    unpaid,
-    unpaidRate: selected.length ? unpaid / selected.length : 0,
-    os,
-    customers,
-    repayment,
-    target,
-  };
+function portfolioPaid(loan) {
+  const v = String(loan?.paymentMin1x ?? "").trim().toLowerCase();
+  return ["1", "true", "yes", "y", "paid", "paid 1x", "lunas", "terbayar", "sudah bayar"].includes(v);
 }
 
-function buildPortfolioDashboard() {
-  const loans = Object.values(loanMemory.loans).filter(dashboardLoanEligible);
-  const buckets = ["current", "1-30", "31-90"];
-  const summary = { all: dashboardAggregate(loans, "all") };
-  for (const b of buckets) summary[b] = dashboardAggregate(loans, b);
+function buildPortfolioDashboardData() {
+  const targets = { current: 0.98, "1-30": 0.55, "31-90": 0.13 };
+  const rows = Object.values(loanMemory.loans || {})
+    .filter(x => portfolioAreaIsBangkalan(x.area) && x.status !== "PAID")
+    .map(x => ({ ...x, bucket: portfolioDashboardBucket(x) }))
+    .filter(x => x.bucket);
 
-  const points = [];
-  const bps = [];
-  const pointNames = [...new Set(loans.map((x) => String(x.point || "-")).filter(Boolean))].sort();
+  const points = new Set();
+  const bps = new Set();
+  const customerSets = { all: new Set(), current: new Set(), "1-30": new Set(), "31-90": new Set() };
+  const aggregate = (list, target) => {
+    const loans = list.length;
+    const unpaid = list.filter(x => !portfolioPaid(x)).length;
+    const paid = loans - unpaid;
+    const os = list.reduce((n, x) => n + Number(x.osNew || x.osOld || 0), 0);
+    const customers = new Set(list.map(x => x.customerNumber).filter(Boolean)).size;
+    return { loans, unpaid, paid, repayment: loans ? paid / loans : null, unpaidRate: loans ? unpaid / loans : null, os, customers, target };
+  };
 
-  for (const point of pointNames) {
-    for (const bucket of buckets) {
-      const rows = loans.filter((x) => String(x.point || "-") === point && dashboardBucketForLoan(x) === bucket);
-      if (!rows.length) continue;
-      const s = dashboardAggregate(rows, bucket);
-      const gap = s.repayment - s.target;
-      points.push({ point, bucket, ...s, gap, priority: Math.max(0, -gap) * 1000 + s.unpaid });
-      const bpNames = [...new Set(rows.map((x) => String(x.bp || "-")).filter(Boolean))].sort();
-      for (const bp of bpNames) {
-        const br = rows.filter((x) => String(x.bp || "-") === bp);
-        const bs = dashboardAggregate(br, bucket);
-        const bgap = bs.repayment - bs.target;
-        bps.push({ point, bp, bucket, ...bs, gap: bgap, priority: Math.max(0, -bgap) * 1000 + bs.unpaid });
-      }
-    }
+  for (const x of rows) {
+    if (x.point) points.add(x.point);
+    if (x.bp) bps.add(x.bp);
+    customerSets.all.add(x.customerNumber || x.customerName || x.loanId);
+    customerSets[x.bucket].add(x.customerNumber || x.customerName || x.loanId);
   }
 
-  // Point view in the UI uses the currently selected bucket. Keep one aggregate row per point for that bucket.
-  const pointAggregate = [];
-  for (const point of pointNames) {
-    const rows = loans.filter((x) => String(x.point || "-") === point);
-    const s = dashboardAggregate(rows, "all");
-    const gap = null;
-    pointAggregate.push({ point, bucket: "all", ...s, target: null, gap, priority: s.unpaid });
-  }
-  const pointByBucket = [];
-  for (const point of pointNames) {
-    for (const bucket of buckets) {
-      const rows = loans.filter((x) => String(x.point || "-") === point && dashboardBucketForLoan(x) === bucket);
-      if (!rows.length) continue;
-      const s = dashboardAggregate(rows, bucket);
-      const gap = s.repayment - s.target;
-      pointByBucket.push({ point, bucket, ...s, gap, priority: Math.max(0, -gap) * 1000 + s.unpaid });
-    }
-  }
+  const summary = { all: aggregate(rows, null) };
+  for (const b of ["current", "1-30", "31-90"]) summary[b] = aggregate(rows.filter(x => x.bucket === b), targets[b]);
 
-  // The front-end can select a bucket; for "all" show the aggregate point rows.
-  const combinedPoints = [...pointAggregate, ...pointByBucket];
-  const seen = new Set();
-  const uniquePoints = combinedPoints.filter((x) => {
-    const key = `${x.point}|${x.bucket || "all"}`;
-    if (seen.has(key)) return false;
-    seen.add(key); return true;
+  const pointMap = new Map();
+  const bpMap = new Map();
+  const pointAllMap = new Map();
+  const bpAllMap = new Map();
+  for (const x of rows) {
+    const pk = `${x.point || "-"}|${x.bucket}`;
+    if (!pointMap.has(pk)) pointMap.set(pk, []);
+    pointMap.get(pk).push(x);
+    const bk = `${x.point || "-"}|${x.bp || "-"}|${x.bucket}`;
+    if (!bpMap.has(bk)) bpMap.set(bk, []);
+    bpMap.get(bk).push(x);
+    const pAll = x.point || "-";
+    if (!pointAllMap.has(pAll)) pointAllMap.set(pAll, []);
+    pointAllMap.get(pAll).push(x);
+    const bAll = `${x.point || "-"}|${x.bp || "-"}`;
+    if (!bpAllMap.has(bAll)) bpAllMap.set(bAll, []);
+    bpAllMap.get(bAll).push(x);
+  }
+  const makeBreakdown = (map, mode = "bucket") => [...map.entries()].map(([key, list]) => {
+    const [point, ...rest] = key.split("|");
+    const bucket = mode === "all" ? "all" : rest[rest.length - 1];
+    const label = mode === "all" ? rest.join("|") : rest.slice(0, -1).join("|");
+    const a = aggregate(list, targets[bucket]);
+    const gap = a.repayment == null ? null : a.repayment - a.target;
+    return { point, bp: mode === "all" ? (map === bpAllMap ? label : undefined) : (map === bpMap ? label : undefined), bucket, ...a, gap, priority: (gap == null ? 0 : Math.max(0, -gap)) * 100 + a.unpaid };
   });
+  const pointRows = [...makeBreakdown(pointMap), ...makeBreakdown(pointAllMap, "all")];
+  const bpRows = [...makeBreakdown(bpMap), ...makeBreakdown(bpAllMap, "all")];
 
-  const updatedAt = loanMemory.updatedAt || null;
-  const updatedAtLabel = updatedAt ? new Date(updatedAt).toLocaleString("id-ID", { dateStyle: "medium", timeStyle: "short" }) : "belum ada";
   return {
-    generatedAt: new Date().toISOString(),
-    updatedAt,
-    updatedAtLabel,
-    pointCount: pointNames.length,
-    bpCount: new Set(loans.map((x) => x.bp).filter(Boolean)).size,
+    updatedAt: loanMemory.updatedAt || new Date().toISOString(),
+    updatedAtLabel: loanMemory.updatedAt ? new Date(loanMemory.updatedAt).toLocaleString("id-ID") : "belum ada",
     summary,
-    points: uniquePoints,
-    bps,
+    points: pointRows,
+    bps: bpRows,
+    pointCount: points.size,
+    bpCount: bps.size,
+    customerCount: customerSets.all.size,
   };
 }
 
-function dashboardTokenAllowed(req) {
-  const expected = String(process.env.DASHBOARD_TOKEN || "").trim();
-  if (!expected) return true;
-  const provided = String(req.query.token || req.headers["x-dashboard-token"] || "").trim();
-  return provided === expected;
-}
-
-app.get("/dashboard", async (req, res) => {
-  if (!dashboardTokenAllowed(req)) return res.status(401).send("Dashboard token tidak valid.");
-  try {
-    res.send(await fs.readFile(path.join(__dirname, "public", "dashboard.html"), "utf8"));
-  } catch (err) {
-    console.error("DASHBOARD HTML ERROR:", err);
-    res.status(500).send("Dashboard belum tersedia.");
-  }
-});
-
+app.use("/dashboard", express.static(path.join(__dirname, "public")));
+app.get("/dashboard", (req, res) => res.sendFile(path.join(__dirname, "public", "dashboard.html")));
 app.get("/api/dashboard", (req, res) => {
-  if (!dashboardTokenAllowed(req)) return res.status(401).json({ error: "Dashboard token tidak valid." });
-  try {
-    res.set("Cache-Control", "no-store");
-    res.json(buildPortfolioDashboard());
-  } catch (err) {
-    console.error("DASHBOARD API ERROR:", err);
-    res.status(500).json({ error: "Gagal membaca Portfolio Database." });
-  }
+  if (!dashboardTokenOk(req)) return res.status(401).json({ error: "Dashboard token tidak valid." });
+  res.json(buildPortfolioDashboardData());
 });
 
 // ======================================================
