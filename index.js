@@ -2138,26 +2138,14 @@ async function startBot() {
         msg.message.documentWithCaptionMessage?.message?.documentMessage?.caption ||
         "";
 
-      // Spreadsheet / CSV / Google Sheets engine.
-      try {
-        const handledFile = await processSpreadsheetUpload(sock, from, msg, text);
-        if (handledFile) return;
-        const handledLink = await processSpreadsheetLink(sock, from, text);
-        if (handledLink) return;
-      } catch (spreadsheetErr) {
-        console.error("Spreadsheet engine error:", spreadsheetErr);
-      }
-
-      // Pesan teks yang dikirim oleh akun bot sendiri tetap diabaikan agar tidak loop.
-      // File spreadsheet sudah diproses di atas sebelum pengecekan fromMe.
-      if (msg.key.fromMe) return;
-
-      // AUTO REPLY NOMOR KHUSUS: semua pesan dari nomor target di grup
-      // langsung dibalas dengan template khusus, tanpa melewati Gemini.
-      if (isGroup) {
+      // Tentukan pengirim khusus lebih awal. Ini harus dilakukan SEBELUM
+      // engine spreadsheet, karena nama file seperti "1-30" juga merupakan
+      // trigger auto-KPI dan sebelumnya membuat pesan dari Komandan berhenti
+      // di engine file sebelum special auto-reply dijalankan.
+      let isSpecialSender = false;
+      if (isGroup && !msg.key.fromMe) {
         const senderJid = msg.key.participant || msg.key.remoteJid;
-        const isSpecialSender =
-          await isSpecialAutoReplySender(sock, from, senderJid);
+        isSpecialSender = await isSpecialAutoReplySender(sock, from, senderJid);
 
         if (isSpecialSender) {
           try {
@@ -2170,9 +2158,27 @@ async function startBot() {
               specialReplyErr
             );
           }
-          return;
         }
       }
+
+      // Spreadsheet / CSV / Google Sheets engine.
+      // Untuk pengirim khusus, balasan komandan sudah dikirim di atas,
+      // tetapi file tetap diproses agar fungsi auto-KPI tidak hilang.
+      try {
+        const handledFile = await processSpreadsheetUpload(sock, from, msg, text);
+        if (handledFile) return;
+        const handledLink = await processSpreadsheetLink(sock, from, text);
+        if (handledLink) return;
+      } catch (spreadsheetErr) {
+        console.error("Spreadsheet engine error:", spreadsheetErr);
+      }
+
+      // Pesan teks yang dikirim oleh akun bot sendiri tetap diabaikan agar tidak loop.
+      if (msg.key.fromMe) return;
+
+      // Untuk nomor khusus: sudah mendapat balasan khusus dan tidak perlu
+      // diteruskan ke Gemini / handler percakapan umum.
+      if (isSpecialSender) return;
 
       const mentionedJids =
         msg.message.extendedTextMessage?.contextInfo
