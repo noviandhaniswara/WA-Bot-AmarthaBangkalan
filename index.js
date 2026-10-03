@@ -2230,6 +2230,33 @@ async function startBot() {
   sock.ev.on(
     "messages.upsert",
     async ({ messages }) => {
+      if (!Array.isArray(messages) || !messages.length) return;
+
+      // Baileys dapat mengirim beberapa pesan/file dalam satu event upsert.
+      // Proses semua spreadsheet terlebih dahulu agar file kedua/ketiga tidak terlewat.
+      let handledSpreadsheetInBatch = false;
+      for (const batchMsg of messages) {
+        if (!batchMsg?.message) continue;
+        const batchFrom = batchMsg.key.remoteJid;
+        if (!batchFrom) continue;
+        const batchText =
+          batchMsg.message.conversation ||
+          batchMsg.message.extendedTextMessage?.text ||
+          batchMsg.message.documentMessage?.caption ||
+          batchMsg.message.documentWithCaptionMessage?.message?.documentMessage?.caption ||
+          "";
+        try {
+          const handledBatchFile = await processSpreadsheetUpload(sock, batchFrom, batchMsg, batchText);
+          if (handledBatchFile) handledSpreadsheetInBatch = true;
+        } catch (batchSpreadsheetErr) {
+          console.error("Spreadsheet batch engine error:", batchSpreadsheetErr);
+        }
+      }
+
+      // Jika batch berisi file spreadsheet, semua file sudah diproses di atas.
+      // Hindari memproses file pertama untuk kedua kalinya.
+      if (handledSpreadsheetInBatch) return;
+
       const msg = messages[0];
 
       if (!msg?.message) return;
