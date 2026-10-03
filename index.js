@@ -1039,6 +1039,7 @@ async function processIncomingDailyReport(sock, from, sender, text) {
 // ======================================================
 
 const spreadsheetSessions = new Map();
+const autoKpiSessions = new Map();
 const dpd3190Sessions = new Map();
 const kpDailySessions = new Map();
 const SPREADSHEET_DIR = path.join(__dirname, "data", "spreadsheet_cache");
@@ -1374,6 +1375,118 @@ function repaymentForDpd3190Sheets(sources) {
   };
 }
 
+
+const PQI_CONFIG = { target: 0.92 };
+
+function firstSheetFromSession(session) {
+  return activeSheetFor(session);
+}
+
+function pqiBucketFromSheet(sheet, pointFilter = null, minDpd = 0, maxDpd = 0) {
+  if (!sheet?.detected) return null;
+  const d = sheet.detected;
+  if (!d.area || !d.point || !d.paymentMin1x || !d.dpdOld || !d.restructured) return null;
+  const rows = (sheet.rows || []).filter((r) => {
+    if (normalizeArea(r[d.area]) !== "bangkalan") return false;
+    if (pointFilter !== null && String(r[d.point] ?? "").trim() !== String(pointFilter).trim()) return false;
+    if (d.restructured && !isNo(r[d.restructured])) return false;
+    const dpd = toNumber(r[d.dpdOld]);
+    return dpd !== null && dpd >= minDpd && dpd <= maxDpd;
+  });
+  let paid = 0;
+  for (const r of rows) if (isYes(r[d.paymentMin1x])) paid++;
+  return { total: rows.length, paid };
+}
+
+function pqiPointData(state, pointFilter = null) {
+  const autoState = autoKpiSessions.get(state.from) || {};
+  const currentSheet = firstSheetFromSession(autoState.current);
+  const dpd3190 = dpd3190Sessions.get(state.from);
+  const sheet3160 = firstSheetFromSession(dpd3190?.dpd31_60);
+  const sheet130 = state.sheet130;
+  if (!currentSheet || !sheet130 || !sheet3160) return null;
+
+  const current = pqiBucketFromSheet(currentSheet, pointFilter, 0, 0);
+  const d130 = pqiBucketFromSheet(sheet130, pointFilter, 1, 30);
+  const d3160 = pqiBucketFromSheet(sheet3160, pointFilter, 31, 60);
+  if (!current || !d130 || !d3160) return null;
+
+  const c1 = current.total ? current.paid / current.total : null;
+  const denom2 = current.total + d130.total + d3160.total;
+  const numer2 = current.paid + d130.paid + d3160.paid;
+  const c2 = denom2 ? numer2 / denom2 : null;
+  const pqi = Number.isFinite(c1) && Number.isFinite(c2) ? (0.5 * c1) + (0.5 * c2) : null;
+  return { point: pointFilter, current, d130, d3160, component1: c1, component2: c2, pqi };
+}
+
+function buildPqiPoints(from) {
+  const autoState = autoKpiSessions.get(from) || {};
+  const state3190 = dpd3190Sessions.get(from);
+  const currentSheet = firstSheetFromSession(autoState.current);
+  const sheet130 = firstSheetFromSession(autoState.dpd1_30);
+  const sheet3160 = firstSheetFromSession(state3190?.dpd31_60);
+  if (!currentSheet || !sheet130 || !sheet3160) {
+    return { ready: false, missing: [
+      !currentSheet ? "Current" : null,
+      !sheet130 ? "DPD 1–30" : null,
+      !sheet3160 ? "DPD 31–60" : null,
+    ].filter(Boolean) };
+  }
+  const d = currentSheet.detected || {};
+  const d1 = sheet130.detected || {};
+  const d31 = sheet3160.detected || {};
+  const required = [d,d1,d31].every(x => x.area && x.point && x.dpdOld && x.paymentMin1x && x.restructured);
+  if (!required) return { ready: false, missing: ["kolom wajib PQI" ] };
+
+  const pointSet = new Set();
+  for (const [sheet, det, min, max] of [[currentSheet,d,0,0],[sheet130,d1,1,30],[sheet3160,d31,31,60]]) {
+    for (const r of sheet.rows || []) {
+      if (normalizeArea(r[det.area]) !== "bangkalan") continue;
+      if (det.restructured && !isNo(r[det.restructured])) continue;
+      const dpd = toNumber(r[det.dpdOld]);
+      if (dpd === null || dpd < min || dpd > max) continue;
+      const point = String(r[det.point] ?? "").trim();
+      if (point) pointSet.add(point);
+    }
+  }
+  const points = [...pointSet];
+  const results = [];
+  for (const point of points) {
+    const row = pqiPointData({ from }, point);
+    if (!row || !row.current.total && !row.d130.total && !row.d3160.total) continue;
+    results.push(row);
+  }
+  results.sort((a,b) => (a.pqi ?? 0) - (b.pqi ?? 0));
+  return { ready: true, results };
+}
+
+function formatPqiReport(from, requestedPoint = null) {
+  const built = buildPqiPoints(from);
+  if (!built.ready) {
+    return `📊 *PQI AREA BANGKALAN*\n\nMarley belum bisa menghitung PQI. Data yang diperlukan: *Current + DPD 1–30 + DPD 31–60*.\n\nBelum tersedia: ${built.missing.join(" | ")}`;
+  }
+  let rows = built.results;
+  if (requestedPoint) rows = rows.filter(x => x.point.toLowerCase() === requestedPoint.toLowerCase());
+  if (!rows.length) return requestedPoint ? `❌ Point *${requestedPoint}* tidak ditemukan pada data PQI Area Bangkalan.` : "❌ Tidak ada Point Area Bangkalan yang dapat dihitung.";
+
+  const lines = rows.map((x, i) => {
+    const status = x.pqi >= PQI_CONFIG.target ? "🟢 Aspiration" : "🔴 Underperform Collection";
+    return `${i + 1}. *${x.point}* — *${formatPct(x.pqi)}* | ${status}`;
+  });
+  let out = `📊 *PQI AREA BANGKALAN*\nTarget: *${formatPct(PQI_CONFIG.target)}*\n\n${lines.join("\n")}`;
+  if (requestedPoint) {
+    const x = rows[0];
+    out += `\n\n*BREAKDOWN ${x.point.toUpperCase()}*\n` +
+      `Current : ${formatCompactNumber(x.current.paid)}/${formatCompactNumber(x.current.total)} paid\n` +
+      `DPD 1–30 : ${formatCompactNumber(x.d130.paid)}/${formatCompactNumber(x.d130.total)} paid\n` +
+      `DPD 31–60 : ${formatCompactNumber(x.d3160.paid)}/${formatCompactNumber(x.d3160.total)} paid\n` +
+      `PQI Komponen 1 : ${formatPct(x.component1)}\n` +
+      `PQI Komponen 2 : ${formatPct(x.component2)}\n` +
+      `PQI : *${formatPct(x.pqi)}*`;
+  }
+  return out;
+}
+
 function formatDpd3190Report(state, includePoints = true) {
   if (!state?.dpd31_60 || !state?.dpd61_90) {
     const ready = [state?.dpd31_60 ? "31–60 ✓" : "31–60 ✗", state?.dpd61_90 ? "61–90 ✓" : "61–90 ✗"].join(" | ");
@@ -1512,6 +1625,9 @@ async function processSpreadsheetUpload(sock, from, msg, caption = "") {
     spreadsheetSessions.set(from, session);
     if (autoKpiType) {
       const sheet = activeSheetFor(session);
+      const autoState = autoKpiSessions.get(from) || {};
+      autoState[autoKpiType] = session;
+      autoKpiSessions.set(from, autoState);
       await sock.sendMessage(from, { text: formatAutoRepaymentReport(sheet, autoKpiType) });
     } else {
       await sock.sendMessage(from, { text: `✅ Spreadsheet berhasil dibaca.\n\n${listSpreadsheetStatus(session)}\n\nMarley siap menganalisa *file ini saja*.\nContoh: *Marley, analisa repayment*` });
@@ -2138,14 +2254,26 @@ async function startBot() {
         msg.message.documentWithCaptionMessage?.message?.documentMessage?.caption ||
         "";
 
-      // Tentukan pengirim khusus lebih awal. Ini harus dilakukan SEBELUM
-      // engine spreadsheet, karena nama file seperti "1-30" juga merupakan
-      // trigger auto-KPI dan sebelumnya membuat pesan dari Komandan berhenti
-      // di engine file sebelum special auto-reply dijalankan.
-      let isSpecialSender = false;
-      if (isGroup && !msg.key.fromMe) {
+      // Spreadsheet / CSV / Google Sheets engine.
+      try {
+        const handledFile = await processSpreadsheetUpload(sock, from, msg, text);
+        if (handledFile) return;
+        const handledLink = await processSpreadsheetLink(sock, from, text);
+        if (handledLink) return;
+      } catch (spreadsheetErr) {
+        console.error("Spreadsheet engine error:", spreadsheetErr);
+      }
+
+      // Pesan teks yang dikirim oleh akun bot sendiri tetap diabaikan agar tidak loop.
+      // File spreadsheet sudah diproses di atas sebelum pengecekan fromMe.
+      if (msg.key.fromMe) return;
+
+      // AUTO REPLY NOMOR KHUSUS: semua pesan dari nomor target di grup
+      // langsung dibalas dengan template khusus, tanpa melewati Gemini.
+      if (isGroup) {
         const senderJid = msg.key.participant || msg.key.remoteJid;
-        isSpecialSender = await isSpecialAutoReplySender(sock, from, senderJid);
+        const isSpecialSender =
+          await isSpecialAutoReplySender(sock, from, senderJid);
 
         if (isSpecialSender) {
           try {
@@ -2158,27 +2286,9 @@ async function startBot() {
               specialReplyErr
             );
           }
+          return;
         }
       }
-
-      // Spreadsheet / CSV / Google Sheets engine.
-      // Untuk pengirim khusus, balasan komandan sudah dikirim di atas,
-      // tetapi file tetap diproses agar fungsi auto-KPI tidak hilang.
-      try {
-        const handledFile = await processSpreadsheetUpload(sock, from, msg, text);
-        if (handledFile) return;
-        const handledLink = await processSpreadsheetLink(sock, from, text);
-        if (handledLink) return;
-      } catch (spreadsheetErr) {
-        console.error("Spreadsheet engine error:", spreadsheetErr);
-      }
-
-      // Pesan teks yang dikirim oleh akun bot sendiri tetap diabaikan agar tidak loop.
-      if (msg.key.fromMe) return;
-
-      // Untuk nomor khusus: sudah mendapat balasan khusus dan tidak perlu
-      // diteruskan ke Gemini / handler percakapan umum.
-      if (isSpecialSender) return;
 
       const mentionedJids =
         msg.message.extendedTextMessage?.contextInfo
@@ -2404,6 +2514,12 @@ async function startBot() {
         const command =
           text.trim().toLowerCase();
 
+        if (/^\/pqi(?:\s+(.+))?$/i.test(text.trim())) {
+          const m = text.trim().match(/^\/pqi(?:\s+(.+))?$/i);
+          await sock.sendMessage(from, { text: formatPqiReport(from, m?.[1]?.trim() || null) });
+          return;
+        }
+
         const loanCommand = parseLoanCommand(text);
         if (loanCommand) {
           await answerLoanQuery(sock, from, loanCommand);
@@ -2569,6 +2685,7 @@ async function startBot() {
               "/analisa - analisis masalah + saran action plan\n" +
               "/proyeksi - hitung proyeksi dari data di chat\n" +
               "/data - status spreadsheet yang sedang dimuat\n" +
+              "/pqi - hitung PQI per Point Area Bangkalan (Current + DPD 1-30 + DPD 31-60)\n" +
               "/loan <Customer Number/Nama Mitra> - cari data loan\n" +
               "/cari <Customer Number/Nama Mitra> - cari data loan\n" +
               "Upload file DPD 31-60 + DPD 61-90 - menjadi sumber DPD 31-90 (hanya Area Bangkalan, restruktur NO)\n" +
@@ -2591,6 +2708,12 @@ async function startBot() {
           (!isGroup || isMentioned)
         ) {
           await answerLoanQuery(sock, from, stripMentions(text));
+          return;
+        } else if (/\bpqi\b|portfolio\s*quality/i.test(stripMentions(text)) && (!isGroup || isMentioned)) {
+          const cleanQ = stripMentions(text);
+          const pointMatch = cleanQ.match(/\b(?:point|pt)\s+(.+?)(?:\s+(?:pqi|cek|check|berapa|berapa\s+nilai).*)?$/i);
+          const requestedPoint = pointMatch ? pointMatch[1].trim().replace(/[?.!,]+$/g, "") : null;
+          await sock.sendMessage(from, { text: formatPqiReport(from, requestedPoint) });
           return;
         } else if (dpd3190Sessions.has(from) && (!isGroup || isMentioned) && /31\s*[-–_]?\s*90|dpd|repayment|movement|flow|stay|rollback|outstanding|os|point|ranking/i.test(stripMentions(text))) {
           const cleanQ = stripMentions(text);
