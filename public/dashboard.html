@@ -1,1 +1,50 @@
-<!-- Marley Dashboard -->
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Marley — Portfolio Control Tower</title>
+<style>
+:root{--bg:#08111f;--panel:#0f1b2d;--panel2:#13233a;--line:#22334d;--text:#eef5ff;--muted:#8fa4bf;--good:#35d07f;--warn:#ffc857;--bad:#ff667d;--accent:#5aa9ff;--shadow:0 18px 45px rgba(0,0,0,.28)}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 10% 0%,#122747 0,#08111f 42%,#050b14 100%);color:var(--text);font-family:Inter,ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif}button,select{font:inherit}.wrap{max-width:1500px;margin:auto;padding:28px}.top{display:flex;justify-content:space-between;gap:20px;align-items:flex-start;margin-bottom:24px}.brand{display:flex;gap:14px;align-items:center}.logo{width:48px;height:48px;border-radius:15px;background:linear-gradient(135deg,#5aa9ff,#8c63ff);display:grid;place-items:center;font-weight:900;font-size:20px;box-shadow:0 12px 28px rgba(90,169,255,.25)}h1{font-size:27px;margin:0;letter-spacing:-.6px}.sub{color:var(--muted);margin-top:4px;font-size:13px}.actions{display:flex;gap:8px;align-items:center}.btn,.select{background:#0e1a2c;color:var(--text);border:1px solid var(--line);padding:9px 12px;border-radius:10px}.btn{cursor:pointer}.btn:hover{border-color:#3b5d86}.grid{display:grid;gap:14px}.kpis{grid-template-columns:repeat(4,minmax(0,1fr));margin-bottom:14px}.card{background:linear-gradient(180deg,rgba(19,35,58,.94),rgba(12,24,41,.94));border:1px solid var(--line);border-radius:16px;box-shadow:var(--shadow)}.kpi{padding:18px;position:relative;overflow:hidden}.kpi:after{content:"";position:absolute;width:100px;height:100px;border-radius:50%;right:-35px;top:-45px;background:rgba(90,169,255,.08)}.label{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.8px}.big{font-size:30px;font-weight:800;margin:7px 0}.meta{font-size:12px;color:var(--muted)}.good{color:var(--good)}.warn{color:var(--warn)}.bad{color:var(--bad)}.layout{grid-template-columns:1.35fr .85fr;margin-bottom:14px}.panel{padding:18px}.panelhead{display:flex;justify-content:space-between;gap:10px;align-items:center;margin-bottom:14px}.paneltitle{font-size:15px;font-weight:750}.small{font-size:11px;color:var(--muted)}table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:10px 8px;border-bottom:1px solid rgba(34,51,77,.75);text-align:left;white-space:nowrap}th{color:#9eb3cd;font-weight:650;font-size:11px;text-transform:uppercase;letter-spacing:.4px}tr:last-child td{border-bottom:0}.bar{height:7px;background:#0a1422;border-radius:99px;overflow:hidden;margin-top:6px}.fill{height:100%;border-radius:99px}.pill{display:inline-flex;align-items:center;padding:4px 8px;border-radius:999px;background:#162842;color:#bcd2ed;font-size:11px}.dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:6px;background:var(--muted)}.scroll{overflow:auto}.filters{display:flex;flex-wrap:wrap;gap:8px}.hero{grid-column:1/-1;padding:18px;display:flex;align-items:center;justify-content:space-between;gap:18px}.hero .headline{font-size:16px;font-weight:750}.hero .headline span{color:var(--accent)}.cards{grid-template-columns:repeat(3,minmax(0,1fr));margin-top:14px}.empty{padding:25px;color:var(--muted);text-align:center}.footer{color:#6f849e;font-size:11px;margin-top:14px;text-align:right}@media(max-width:1100px){.kpis{grid-template-columns:repeat(2,1fr)}.layout{grid-template-columns:1fr}.cards{grid-template-columns:1fr}}@media(max-width:650px){.wrap{padding:15px}.top{flex-direction:column}.kpis{grid-template-columns:1fr}.hero{align-items:flex-start;flex-direction:column}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top">
+    <div class="brand"><div class="logo">M</div><div><h1>MARLEY — Portfolio Control Tower</h1><div class="sub">AREA BANGKALAN • monitoring portofolio & collection</div></div></div>
+    <div class="actions"><select id="bucket" class="select"><option value="all">Semua Bucket</option><option value="current">Current / DPD 0</option><option value="1-30">DPD 1–30</option><option value="31-90">DPD 31–90</option></select><select id="point" class="select"><option value="all">Semua Point</option></select><button id="refresh" class="btn">↻ Refresh</button></div>
+  </div>
+
+  <div id="hero" class="card hero"></div>
+  <div id="kpis" class="grid kpis"></div>
+
+  <div class="grid layout">
+    <section class="card panel"><div class="panelhead"><div><div class="paneltitle">Point Performance</div><div class="small">Repayment, gap target, unpaid & OS</div></div><div id="pointCount" class="pill"></div></div><div class="scroll"><table><thead><tr><th>Point</th><th>Repayment</th><th>Target</th><th>Gap</th><th>Unpaid</th><th>OS</th></tr></thead><tbody id="pointTable"></tbody></table></div></section>
+    <section class="card panel"><div class="panelhead"><div><div class="paneltitle">Collection Priority</div><div class="small">Prioritas berdasarkan gap & jumlah unpaid</div></div></div><div id="priority"></div></section>
+  </div>
+
+  <section class="card panel"><div class="panelhead"><div><div class="paneltitle">BP Performance</div><div class="small">Agent fullname • klik filter Point untuk drill-down</div></div><div id="bpCount" class="pill"></div></div><div class="scroll"><table><thead><tr><th>Point</th><th>BP</th><th>Bucket</th><th>Repayment</th><th>Target</th><th>Gap</th><th>Unpaid</th><th>OS</th></tr></thead><tbody id="bpTable"></tbody></table></div></section>
+  <div class="footer" id="updated"></div>
+</div>
+<script>
+const state={data:null};
+const $=id=>document.getElementById(id);
+const fmtN=n=>new Intl.NumberFormat('id-ID').format(Math.round(n||0));
+const fmtMoney=n=>{n=Number(n||0);if(Math.abs(n)>=1e9)return 'Rp '+(n/1e9).toFixed(2)+' M';if(Math.abs(n)>=1e6)return 'Rp '+(n/1e6).toFixed(1)+' jt';if(Math.abs(n)>=1e3)return 'Rp '+(n/1e3).toFixed(0)+' rb';return 'Rp '+fmtN(n)};
+const pct=x=>Number.isFinite(x)?(x*100).toFixed(2)+'%':'-';
+const cls=x=>!Number.isFinite(x)?'':x>=0?'good':x>=-0.05?'warn':'bad';
+function bucketLabel(b){return b==='current'?'Current':b==='1-30'?'DPD 1–30':b==='31-90'?'DPD 31–90':'Semua'}
+function render(){const d=state.data; if(!d)return; const b=$('bucket').value,p=$('point').value; const s=d.summary[b];
+ $('hero').innerHTML=`<div><div class="headline">Portfolio Health <span>${bucketLabel(b)}</span></div><div class="small">${fmtN(s.loans)} loan • ${fmtN(s.unpaid)} unpaid • OS ${fmtMoney(s.os)}</div></div><div class="filters"><span class="pill"><i class="dot" style="background:var(--good)"></i>Target ${Number.isFinite(s.target)?pct(s.target):'—'}</span><span class="pill">Updated ${d.updatedAtLabel}</span></div>`;
+ const gap=Number.isFinite(s.target)?s.repayment-s.target:NaN;
+ $('kpis').innerHTML=[['Repayment',pct(s.repayment),`Target ${pct(s.target)} • Gap ${pct(gap)}`,cls(gap)],['Unpaid',fmtN(s.unpaid),`${pct(s.unpaidRate)} dari loan`,s.unpaid?'bad':'good'],['Outstanding',fmtMoney(s.os),`${fmtN(s.loans)} loan`,'' ],['Customer',fmtN(s.customers),`Point ${d.pointCount} • BP ${d.bpCount}`,'' ]].map(x=>`<div class="card kpi"><div class="label">${x[0]}</div><div class="big ${x[3]}">${x[1]}</div><div class="meta">${x[2]}</div></div>`).join('');
+ const points=d.points.filter(x=>p==='all'||x.point===p).filter(x=>b==='all'?x.bucket==='all':x.bucket===b); $('pointCount').textContent=points.length+' point'; $('pointTable').innerHTML=points.length?points.map(x=>`<tr><td><b>${x.point}</b></td><td class="${cls(x.gap)}">${pct(x.repayment)}</td><td>${pct(x.target)}</td><td class="${cls(x.gap)}">${pct(x.gap)}</td><td>${fmtN(x.unpaid)}</td><td>${fmtMoney(x.os)}</td></tr>`).join(''):`<tr><td colspan="6" class="empty">Tidak ada data.</td></tr>`;
+ const pr=points.slice().sort((a,z)=>z.priority-a.priority).slice(0,6); $('priority').innerHTML=pr.length?pr.map((x,i)=>`<div style="padding:10px 0;border-bottom:1px solid var(--line)"><div style="display:flex;justify-content:space-between;gap:8px"><b>${i+1}. ${x.point}</b><span class="${cls(x.gap)}">${pct(x.gap)}</span></div><div class="small">${fmtN(x.unpaid)} unpaid • OS ${fmtMoney(x.os)}</div><div class="bar"><div class="fill" style="width:${Math.min(100,Math.max(0,x.repayment*100))}%;background:${x.repayment>=x.target?'var(--good)':'var(--bad)'}"></div></div></div>`).join(''):`<div class="empty">Tidak ada data.</div>`;
+ const bps=d.bps.filter(x=>(p==='all'||x.point===p)&&(b==='all'||x.bucket===b)); $('bpCount').textContent=bps.length+' BP'; $('bpTable').innerHTML=bps.length?bps.sort((a,z)=>z.priority-a.priority).slice(0,150).map(x=>`<tr><td>${x.point}</td><td><b>${x.bp||'-'}</b></td><td><span class="pill">${bucketLabel(x.bucket)}</span></td><td class="${cls(x.gap)}">${pct(x.repayment)}</td><td>${pct(x.target)}</td><td class="${cls(x.gap)}">${pct(x.gap)}</td><td>${fmtN(x.unpaid)}</td><td>${fmtMoney(x.os)}</td></tr>`).join(''):`<tr><td colspan="8" class="empty">Tidak ada data.</td></tr>`;
+ $('updated').textContent='Marley Dashboard • sumber: Portfolio Database • '+d.updatedAtLabel;
+}
+async function load(){const token=new URLSearchParams(location.search).get('token'); const url='/api/dashboard'+(token?'?token='+encodeURIComponent(token):''); $('refresh').textContent='Loading…'; try{const r=await fetch(url,{cache:'no-store'});if(!r.ok)throw new Error(await r.text());state.data=await r.json(); const pts=[...new Set(state.data.points.map(x=>x.point))].sort();$('point').innerHTML='<option value="all">Semua Point</option>'+pts.map(x=>`<option>${x}</option>`).join('');render()}catch(e){document.body.innerHTML='<div style="padding:40px;font-family:system-ui;color:#fff;background:#08111f;min-height:100vh"><h2>Dashboard tidak bisa dibuka</h2><p>'+e.message+'</p></div>'}finally{$('refresh').textContent='↻ Refresh'}}
+$('bucket').onchange=render;$('point').onchange=render;$('refresh').onclick=load;load();setInterval(load,180000);
+</script>
+</body></html>
