@@ -5,6 +5,7 @@ import fs from "fs/promises";
 import path from "path";
 import { fileURLToPath } from "url";
 import { GoogleGenAI } from "@google/genai";
+import { createHash } from "crypto";
 import * as XLSX from "xlsx";
 import sharp from "sharp";
 import {
@@ -963,13 +964,29 @@ function portfolioRecordFromRow(row, d, sourceName, sourceDate) {
   };
 }
 
-function makePortfolioFingerprint(sourceName, rows, sourceDate) {
-  const first = rows[0] || {};
-  const last = rows[rows.length - 1] || {};
-  return [sourceName, sourceDate || "", rows.length, JSON.stringify(first), JSON.stringify(last)].join("|");
+function makePortfolioFingerprint(buffer) {
+  return createHash("sha256").update(buffer).digest("hex");
 }
 
 async function syncOpsReportToPortfolioDatabase(buffer, sourceName) {
+  const fileHash = makePortfolioFingerprint(buffer);
+  const already = loanHistory.find((x) => x.fileHash === fileHash);
+  if (already) {
+    return {
+      duplicate: true,
+      fileHash,
+      sourceName,
+      sourceDate: already.sourceDate || new Date().toISOString().slice(0, 10),
+      totalRows: already.totalRows || 0,
+      bangkalanRows: already.bangkalanRows || 0,
+      added: 0,
+      updated: 0,
+      skipped: 0,
+      totalLoans: Object.keys(loanMemory.loans).length,
+      customers: Object.keys(loanMemory.customers).length,
+    };
+  }
+
   const workbook = XLSX.read(buffer, { type: "buffer", cellDates: true, raw: true });
   const sheets = workbook.SheetNames || [];
   let totalRows = 0, bangkalanRows = 0, added = 0, updated = 0, skipped = 0;
@@ -1029,21 +1046,17 @@ async function syncOpsReportToPortfolioDatabase(buffer, sourceName) {
     }
   }
 
-  const fingerprint = makePortfolioFingerprint(sourceName, Object.values(loanMemory.loans).slice(-Math.min(bangkalanRows, 20)), sourceDate);
-  const already = loanHistory.find((x) => x.fingerprint === fingerprint);
-  if (!already) {
-    loanHistory.push({
-      syncedAt: new Date().toISOString(),
-      sourceName,
-      sourceDate,
-      totalRows,
-      bangkalanRows,
-      added,
-      updated,
-      skipped,
-      fingerprint,
-    });
-  }
+  loanHistory.push({
+    syncedAt: new Date().toISOString(),
+    sourceName,
+    sourceDate,
+    totalRows,
+    bangkalanRows,
+    added,
+    updated,
+    skipped,
+    fileHash,
+  });
 
   await savePortfolioDatabase();
   await saveLoanHistory();
@@ -1079,6 +1092,11 @@ async function processOpsReportUpload(sock, from, msg, filename) {
     await sock.sendMessage(from, { text: `🗄️ Marley menyimpan *${filename}* ke Portfolio Database...` });
     const buffer = await downloadMediaMessage(msg, "buffer", {});
     const result = await syncOpsReportToPortfolioDatabase(buffer, filename);
+    if (result.duplicate) {
+      await sock.sendMessage(from, { text: `ℹ️ *OPS REPORT SUDAH ADA*\n\nFile yang sama persis sudah pernah diproses.\nTidak ada data yang dihitung ulang.` });
+      return true;
+    }
+
     await sock.sendMessage(from, { text: `✅ *OPS REPORT TERSIMPAN*\n\nBangkalan: ${result.bangkalanRows.toLocaleString("id-ID")} baris\n➕ Baru: ${result.added.toLocaleString("id-ID")}\n🔄 Diperbarui: ${result.updated.toLocaleString("id-ID")}\n⚠️ Dilewati: ${result.skipped.toLocaleString("id-ID")}\n\nTotal loan di database: ${result.totalLoans.toLocaleString("id-ID")}\nCustomer: ${result.customers.toLocaleString("id-ID")}\n\nRecord yang tidak muncul pada report terbaru *tidak dianggap lunas*.` });
     return true;
   } catch (err) {
