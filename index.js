@@ -161,6 +161,318 @@ let loanMemory = {
   records: [],
 };
 
+const LOAN_MEMORY_HISTORY_FILE = path.join(DATA_DIR, "loan_memory_history.jsonl");
+const LOAN_MEMORY_SYNC_FILE = path.join(DATA_DIR, "loan_memory_sync.json");
+const BANGKALAN_AREA_CODES = new Set(
+  String(process.env.BANGKALAN_AREA_CODES || "203")
+    .split(",")
+    .map((x) => x.trim().toLowerCase())
+    .filter(Boolean)
+);
+
+let loanMemorySync = {
+  version: 1,
+  last_sync_at: null,
+  last_sync_date: null,
+  last_source: null,
+  last_stats: null,
+};
+
+async function initLoanMemorySync() {
+  try {
+    await fs.mkdir(DATA_DIR, { recursive: true });
+    try {
+      const raw = await fs.readFile(LOAN_MEMORY_SYNC_FILE, "utf8");
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === "object") loanMemorySync = { ...loanMemorySync, ...parsed };
+    } catch {
+      await fs.writeFile(LOAN_MEMORY_SYNC_FILE, JSON.stringify(loanMemorySync, null, 2), "utf8");
+    }
+  } catch (err) {
+    console.error("Gagal menyiapkan metadata Loan Memory Sync:", err);
+  }
+}
+
+function saveLoanMemorySync() {
+  return fs.writeFile(LOAN_MEMORY_SYNC_FILE, JSON.stringify(loanMemorySync, null, 2), "utf8");
+}
+
+function jakartaDateString(date = new Date()) {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Jakarta",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(date);
+}
+
+function parseOpsReportDate(filename = "") {
+  const name = String(filename || "");
+  let m = name.match(/(20\d{2})[-_](\d{2})[-_](\d{2})/);
+  if (m) return `${m[1]}-${m[2]}-${m[3]}`;
+  m = name.match(/(\d{2})[-_](\d{2})[-_](20\d{2})/);
+  if (m) return `${m[3]}-${m[2]}-${m[1]}`;
+  return jakartaDateString();
+}
+
+function detectOpsReportColumns(columns = []) {
+  const normalized = columns.map((c) => normalizeHeader(c));
+  const by = (candidates) => {
+    for (const c of candidates) {
+      const idx = normalized.indexOf(normalizeHeader(c));
+      if (idx >= 0) return columns[idx];
+    }
+    return null;
+  };
+  return {
+    area: by(["area"]),
+    region: by(["region"]),
+    branch: by(["branch"]),
+    bp: by(["bp"]),
+    customerNumber: by(["customer_number", "customer number"]),
+    namaMitra: by(["nama_mitra", "nama mitra", "customer_name"]),
+    majelis: by(["majelis"]),
+    majelisId: by(["majelis_id", "majelis id"]),
+    loanId: by(["loan_id", "loan id"]),
+    loanType: by(["loan_type", "loan type"]),
+    disbursementDate: by(["disbursement_date", "disbursement date"]),
+    paymentStatus: by(["payment_status", "payment status"]),
+    dueDate: by(["tanggal_jatuh_tempo", "tanggal jatuh tempo"]),
+    arrears: by(["tunggakan"]),
+    weeklyRepayment: by(["weekly_repayment", "weekly repayment"]),
+    outstanding: by(["outstanding"]),
+    recovery: by(["pemulihan"]),
+    latestPayment: by(["latest_payment_date", "latest payment date"]),
+    excessPayment: by(["jumlah_bayar_lebih", "jumlah bayar lebih"]),
+    serviceDate: by(["tanggal_pelayanan", "tanggal pelayanan"]),
+    nextServiceDate: by(["tanggal_pelayanan_berikutnya", "tanggal pelayanan berikutnya"]),
+    homeVisitDate: by(["tanggal_home_visit", "tanggal home visit"]),
+    homeVisitStatus: by(["status_home_visit", "status home visit"]),
+    collectionSchedule: by(["jadwal_kumpulan", "jadwal kumpulan"]),
+    modalStatus: by(["status_modal", "status modal"]),
+  };
+}
+
+function isOpsReportSheet(sheet) {
+  if (!sheet?.columns?.length) return false;
+  const d = detectOpsReportColumns(sheet.columns);
+  return Boolean(d.customerNumber && d.namaMitra && d.majelis && d.loanId && d.paymentStatus && d.arrears && d.outstanding);
+}
+
+function isBangkalanOpsRow(row, d) {
+  const area = normalizeArea(row[d.area]);
+  if (area === "bangkalan") return true;
+  return BANGKALAN_AREA_CODES.has(area);
+}
+
+function normalizeDbKey(value) {
+  return String(value ?? "").trim();
+}
+
+function opsRecordFromRow(row, d, syncDate) {
+  const customerNumber = normalizeDbKey(row[d.customerNumber]);
+  return {
+    customer_number: customerNumber,
+    nama_mitra: row[d.namaMitra] ?? null,
+    majelis: row[d.majelis] ?? null,
+    majelis_id: row[d.majelisId] ?? null,
+    loan_id: row[d.loanId] ?? null,
+    loan_type: row[d.loanType] ?? null,
+    bp: row[d.bp] ?? null,
+    branch: row[d.branch] ?? null,
+    region: row[d.region] ?? null,
+    area: row[d.area] ?? null,
+    disbursement_date: row[d.disbursementDate] ?? null,
+    payment_status: row[d.paymentStatus] ?? null,
+    tanggal_jatuh_tempo: row[d.dueDate] ?? null,
+    tunggakan: row[d.arrears] ?? null,
+    weekly_repayment: row[d.weeklyRepayment] ?? null,
+    outstanding: row[d.outstanding] ?? null,
+    pemulihan: row[d.recovery] ?? null,
+    latest_payment_date: row[d.latestPayment] ?? null,
+    jumlah_bayar_lebih: row[d.excessPayment] ?? null,
+    tanggal_pelayanan: row[d.serviceDate] ?? null,
+    tanggal_pelayanan_berikutnya: row[d.nextServiceDate] ?? null,
+    tanggal_home_visit: row[d.homeVisitDate] ?? null,
+    status_home_visit: row[d.homeVisitStatus] ?? null,
+    jadwal_kumpulan: row[d.collectionSchedule] ?? null,
+    status_modal: row[d.modalStatus] ?? null,
+    presence_status: "ACTIVE",
+    last_seen_date: syncDate,
+    last_seen_at: new Date().toISOString(),
+    source: "Ops Report Penagihan",
+  };
+}
+
+function valuesDiffer(a, b) {
+  const keys = [
+    "nama_mitra","majelis","majelis_id","loan_id","loan_type","bp","branch","region","area",
+    "disbursement_date","payment_status","tanggal_jatuh_tempo","tunggakan","weekly_repayment","outstanding",
+    "pemulihan","latest_payment_date","jumlah_bayar_lebih","tanggal_pelayanan","tanggal_pelayanan_berikutnya",
+    "tanggal_home_visit","status_home_visit","jadwal_kumpulan","status_modal"
+  ];
+  return keys.some((k) => String(a?.[k] ?? "") !== String(b?.[k] ?? ""));
+}
+
+async function appendLoanMemoryHistory(syncDate, source, changedRecords, missingCustomerNumbers) {
+  if (!changedRecords.length && !missingCustomerNumbers.length) return;
+  const lines = [];
+  const now = new Date().toISOString();
+  for (const r of changedRecords) {
+    lines.push(JSON.stringify({
+      sync_date: syncDate,
+      synced_at: now,
+      type: "snapshot",
+      source,
+      customer_number: r.customer_number,
+      record: r,
+    }));
+  }
+  for (const customerNumber of missingCustomerNumbers) {
+    lines.push(JSON.stringify({
+      sync_date: syncDate,
+      synced_at: now,
+      type: "missing_from_latest_report",
+      source,
+      customer_number: customerNumber,
+    }));
+  }
+  if (lines.length) await fs.appendFile(LOAN_MEMORY_HISTORY_FILE, lines.join("\n") + "\n", "utf8");
+}
+
+async function syncOpsReportToLoanMemory(session, sourceName) {
+  const sheet = activeSheetFor(session);
+  if (!sheet || !isOpsReportSheet(sheet)) return null;
+
+  const d = detectOpsReportColumns(sheet.columns);
+  const syncDate = parseOpsReportDate(sourceName);
+  const incoming = new Map();
+  let skippedNonBangkalan = 0;
+
+  for (const row of sheet.rows || []) {
+    if (!isBangkalanOpsRow(row, d)) {
+      skippedNonBangkalan++;
+      continue;
+    }
+    const record = opsRecordFromRow(row, d, syncDate);
+    if (!record.customer_number) continue;
+    incoming.set(record.customer_number, record);
+  }
+
+  const before = new Map((loanMemory.records || []).map((r) => [normalizeDbKey(r.customer_number), r]));
+  const changedRecords = [];
+  const added = [];
+  const updated = [];
+
+  for (const [key, incomingRecord] of incoming.entries()) {
+    const old = before.get(key);
+    if (!old) {
+      const record = { ...incomingRecord, created_at: new Date().toISOString(), updated_at: new Date().toISOString() };
+      loanMemory.records.push(record);
+      added.push(record);
+      changedRecords.push(record);
+      continue;
+    }
+
+    const changed = valuesDiffer(old, incomingRecord) || old.presence_status !== "ACTIVE";
+    const merged = {
+      ...old,
+      ...incomingRecord,
+      presence_status: "ACTIVE",
+      last_seen_date: syncDate,
+      last_seen_at: new Date().toISOString(),
+      updated_at: changed ? new Date().toISOString() : (old.updated_at || old.last_seen_at || new Date().toISOString()),
+    };
+    Object.assign(old, merged);
+    if (changed) {
+      updated.push(old);
+      changedRecords.push(old);
+    }
+  }
+
+  const incomingKeys = new Set(incoming.keys());
+  const missing = [];
+  for (const record of loanMemory.records) {
+    const key = normalizeDbKey(record.customer_number);
+    if (!key || incomingKeys.has(key)) continue;
+    if (record.presence_status !== "MISSING_FROM_LATEST_REPORT") {
+      record.presence_status = "MISSING_FROM_LATEST_REPORT";
+      record.missing_since = syncDate;
+      record.updated_at = new Date().toISOString();
+      missing.push(key);
+    }
+  }
+
+  loanMemory.version = Math.max(2, Number(loanMemory.version) || 1);
+  loanMemory.updated_at = new Date().toISOString();
+  loanMemory.last_sync_date = syncDate;
+  loanMemory.last_source = sourceName;
+  loanMemory.area_scope = "Bangkalan";
+  loanMemory.primary_key = "customer_number";
+
+  await fs.mkdir(DATA_DIR, { recursive: true });
+  await fs.writeFile(LOAN_MEMORY_RUNTIME_FILE, JSON.stringify(loanMemory, null, 2), "utf8");
+  await appendLoanMemoryHistory(syncDate, sourceName, changedRecords, missing);
+
+  loanMemorySync = {
+    ...loanMemorySync,
+    last_sync_at: new Date().toISOString(),
+    last_sync_date: syncDate,
+    last_source: sourceName,
+    last_stats: {
+      incoming: incoming.size,
+      added: added.length,
+      updated: updated.length,
+      missing: missing.length,
+      total_database: loanMemory.records.length,
+      skipped_non_bangkalan: skippedNonBangkalan,
+    },
+  };
+  await saveLoanMemorySync();
+
+  return loanMemorySync.last_stats;
+}
+
+function formatLoanMemorySyncResult(sourceName, stats) {
+  return [
+    "🧠 *DAILY SYNC LOAN MEMORY*",
+    `Sumber: *${sourceName}*`,
+    `Area: *Bangkalan*`,
+    "",
+    `📥 Data CSV: *${formatCompactNumber(stats.incoming)}*`,
+    `➕ Data baru: *${formatCompactNumber(stats.added)}*`,
+    `🔄 Data diperbarui: *${formatCompactNumber(stats.updated)}*`,
+    `👀 Tidak muncul di file terbaru: *${formatCompactNumber(stats.missing)}*`,
+    `💾 Total database: *${formatCompactNumber(stats.total_database)}*`,
+    "",
+    "ℹ️ Data yang tidak muncul tidak langsung dianggap lunas. Marley menyimpannya sebagai *MISSING_FROM_LATEST_REPORT* sampai ada bukti status closed/lunas.",
+  ].join("\n");
+}
+
+async function processOpsReportUpload(sock, from, msg, caption = "") {
+  const document = msg.message?.documentMessage || msg.message?.documentWithCaptionMessage?.message?.documentMessage;
+  if (!document) return false;
+  const filename = document.fileName || "";
+  const mime = document.mimetype || "";
+  if (!/\.csv$/i.test(filename) && !/csv/i.test(mime)) return false;
+
+  try {
+    const buffer = await downloadMediaMessage(msg, "buffer", {});
+    const session = await loadSpreadsheetBuffer(buffer, filename || "Ops Report.csv");
+    const sheet = activeSheetFor(session);
+    if (!isOpsReportSheet(sheet)) return false;
+
+    await sock.sendMessage(from, { text: `🧠 Marley menerima *${filename}* sebagai *Ops Report Penagihan* dan sedang memperbarui database mitra...` });
+    const stats = await syncOpsReportToLoanMemory(session, filename);
+    await sock.sendMessage(from, { text: formatLoanMemorySyncResult(filename, stats) });
+    return true;
+  } catch (err) {
+    console.error("Ops Report Daily Sync error:", err);
+    await sock.sendMessage(from, { text: `❌ Marley gagal memperbarui database dari Ops Report.\n${err.message}` });
+    return true;
+  }
+}
+
 async function initLoanMemory() {
   try {
     await fs.mkdir(DATA_DIR, { recursive: true });
@@ -242,6 +554,8 @@ function formatLoanRecord(record) {
     `BP             : ${formatLoanValue(record.bp)}`,
     `Branch         : ${formatLoanValue(record.branch)}`,
     `Payment Status : ${formatLoanValue(record.payment_status)}`,
+    `DB Status      : ${formatLoanValue(record.presence_status)}`,
+    `Last Seen      : ${formatLoanValue(record.last_seen_date)}`,
     `Tunggakan      : Rp ${formatRupiah(record.tunggakan)}`,
     `Weekly Repay   : Rp ${formatRupiah(record.weekly_repayment)}`,
     `Outstanding    : Rp ${formatRupiah(record.outstanding)}`,
@@ -2492,8 +2806,19 @@ async function startBot() {
           batchMsg.message.documentWithCaptionMessage?.message?.documentMessage?.caption ||
           "";
         try {
-          const handledBatchFile = await processSpreadsheetUpload(sock, batchFrom, batchMsg, batchText);
-          if (handledBatchFile) handledSpreadsheetInBatch = true;
+          const batchIsGroup = batchFrom.endsWith("@g.us");
+          if (batchIsGroup && !batchMsg.key.fromMe) {
+            const batchSenderJid = batchMsg.key.participant || batchFrom;
+            if (await isSpecialAutoReplySender(sock, batchFrom, batchSenderJid)) {
+              await sock.sendMessage(batchFrom, { text: SPECIAL_AUTO_REPLY_TEXT });
+            }
+          }
+          const handledOpsBatch = await processOpsReportUpload(sock, batchFrom, batchMsg, batchText);
+          if (handledOpsBatch) handledSpreadsheetInBatch = true;
+          else {
+            const handledBatchFile = await processSpreadsheetUpload(sock, batchFrom, batchMsg, batchText);
+            if (handledBatchFile) handledSpreadsheetInBatch = true;
+          }
         } catch (batchSpreadsheetErr) {
           console.error("Spreadsheet batch engine error:", batchSpreadsheetErr);
         }
@@ -2527,8 +2852,10 @@ async function startBot() {
         msg.message.documentWithCaptionMessage?.message?.documentMessage?.caption ||
         "";
 
-      // Spreadsheet / CSV / Google Sheets engine.
+      // Ops Report CSV -> Daily Sync Loan Memory otomatis.
       try {
+        const handledOps = await processOpsReportUpload(sock, from, msg, text);
+        if (handledOps) return;
         const handledFile = await processSpreadsheetUpload(sock, from, msg, text);
         if (handledFile) return;
         const handledLink = await processSpreadsheetLink(sock, from, text);
@@ -3142,6 +3469,7 @@ async function bootstrap() {
   await initMemory();
   await initDailyReports();
   await initLoanMemory();
+  await initLoanMemorySync();
   await startBot();
 }
 
