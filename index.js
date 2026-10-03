@@ -312,6 +312,101 @@ function formatHistory(groupId) {
 // GEMINI
 // ======================================================
 
+// ======================================================
+// LANGUAGE DETECTION MARLEY
+// ======================================================
+// Deteksi ringan berbasis kata/pola agar Marley otomatis
+// mengikuti bahasa user tanpa memanggil AI tambahan.
+// Bahasa yang didukung: Indonesia, Madura, English.
+
+function normalizeLanguageText(text = "") {
+  return String(text)
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9'\s-]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function detectMarleyLanguage(text = "") {
+  const t = normalizeLanguageText(text);
+  if (!t) return "indonesia";
+
+  const words = new Set(t.split(/\s+/).filter(Boolean));
+
+  // English: gunakan beberapa kata/pola yang cukup khas.
+  const englishWords = [
+    "the", "this", "that", "these", "those", "is", "are", "was", "were",
+    "what", "who", "where", "when", "why", "how", "which", "please",
+    "can", "could", "would", "should", "will", "need", "want", "help",
+    "show", "check", "give", "tell", "find", "make", "update", "today",
+    "tomorrow", "yesterday", "morning", "afternoon", "evening", "report",
+    "payment", "loan", "customer", "performance", "target", "dashboard"
+  ];
+  const englishScore = englishWords.reduce((n, w) => n + (words.has(w) ? 1 : 0), 0);
+
+  // Madura: kosakata/pola yang relatif khas. Beberapa kata umum
+  // sengaja diberi bobot kecil agar tidak mudah salah deteksi.
+  const maduraStrong = [
+    "engghi", "enggi", "bunten", "beremmah", "beremma", "dimma",
+    "delemma", "sengkok", "engkok", "sampeyan", "abana", "abana",
+    "bade", "bede", "pole", "ghi", "gi", "disa", "dissa", "dinna",
+    "dhinna", "sapa", "apae", "apah", "jhe'", "jhek", "enten", "entenah",
+    "mator", "sakalangkong", "nyo'on", "ngarte", "se",
+    "oreng", "bhunten", "sengko", "buntenah", "seghi", "seghik"
+  ];
+  const maduraScore = maduraStrong.reduce((n, w) => n + (words.has(w) ? 1 : 0), 0);
+
+  // Pola frasa Madura yang sering muncul dalam chat kerja/lapangan.
+  const maduraPatterns = [
+    /\bberemmah\s+(kab(?:ar|ar)?|kondisi|cara|sekarang|sateya)\b/,
+    /\bsapa\s+se(?:ghi|gi|ng|)\b/,
+    /\bse\s+(tak|ghi|gi|bede|delem|seghi)\b/,
+    /\b(?:engghi|enggi)\s+(engghi|pak|bu|ghi)\b/,
+    /\b(?:sengkok|engkok)\s+(mau|aberri|cek|tanya|ngarte|tak)\b/,
+    /\b(?:sampeyan|abana)\s+(cek|tanya|bisa|mau|engghi)\b/
+  ];
+  const maduraPatternScore = maduraPatterns.reduce((n, re) => n + (re.test(t) ? 2 : 0), 0);
+
+  // Indonesia: kata fungsi umum sebagai baseline.
+  const indonesiaWords = [
+    "yang", "dan", "dari", "untuk", "dengan", "ini", "itu", "apa",
+    "siapa", "bagaimana", "kenapa", "kapan", "dimana", "tolong", "bisa",
+    "sudah", "belum", "akan", "mau", "cek", "lihat", "berapa", "hari",
+    "sekarang", "besok", "laporan", "data", "mitra", "bayar", "pembayaran",
+    "tunggakan", "target", "point", "dashboard"
+  ];
+  const indonesiaScore = indonesiaWords.reduce((n, w) => n + (words.has(w) ? 1 : 0), 0);
+
+  const scores = {
+    indonesia: indonesiaScore,
+    madura: maduraScore + maduraPatternScore,
+    english: englishScore,
+  };
+
+  // Madura diberi prioritas bila ada sinyal khas yang cukup kuat.
+  if (scores.madura >= 2 && scores.madura >= scores.indonesia && scores.madura >= scores.english) {
+    return "madura";
+  }
+  if (scores.english >= 2 && scores.english > scores.indonesia && scores.english > scores.madura) {
+    return "english";
+  }
+  return "indonesia";
+}
+
+function languageInstruction(language) {
+  if (language === "madura") {
+    return `\nBAHASA JAWABAN:\n- User terdeteksi menggunakan Bahasa Madura. Jawab dalam Bahasa Madura yang natural, santai, dan mudah dipahami tim lapangan.\n- Jangan menerjemahkan pertanyaan ke Bahasa Indonesia terlebih dahulu dalam jawaban.\n- Jika ada istilah kerja seperti repayment, DPD, WOB, BP, Point, loan, OS, KPI, pertahankan istilah tersebut agar jelas.\n- Jika ada bagian Bahasa Madura yang ambigu, jangan mengarang arti; gunakan Bahasa Madura sederhana atau campurkan sedikit Bahasa Indonesia bila diperlukan agar maknanya tetap jelas.\n`;
+  }
+
+  if (language === "english") {
+    return `\nRESPONSE LANGUAGE:\n- User is detected as using English. Answer in natural, concise English.\n- Keep operational terms such as repayment, DPD, WOB, BP, Point, loan, OS, and KPI as-is.\n- Do not translate the user's question into Indonesian unless the user asks for translation.\n`;
+  }
+
+  return `\nBAHASA JAWABAN:\n- User terdeteksi menggunakan Bahasa Indonesia. Jawab dalam Bahasa Indonesia yang natural dan santai.\n`;
+}
+
 const MARLEY_CONVERSATION_INSTRUCTION = `
 KAMU ADALAH MARLEY, AI ASSISTANT UNTUK TIM AMARTHA BANGKALAN.
 
@@ -343,7 +438,9 @@ async function askGemini(prompt, context, retries = 3) {
     ? `\n\nKONTEKS CHAT SEBELUMNYA (gunakan hanya untuk memahami konteks, JANGAN dirangkum kecuali diminta):\n${context}\n\n---\n`
     : "";
 
-  const fullPrompt = `${MARLEY_CONVERSATION_INSTRUCTION}${memoryBlock}${contextBlock}\nPESAN USER:\n${prompt}`;
+  const detectedLanguage = detectMarleyLanguage(prompt);
+  const languageBlock = languageInstruction(detectedLanguage);
+  const fullPrompt = `${MARLEY_CONVERSATION_INSTRUCTION}${languageBlock}${memoryBlock}${contextBlock}\nPESAN USER:\n${prompt}`;
 
   for (let attempt = 0; attempt < retries; attempt++) {
     try {
@@ -389,6 +486,8 @@ async function askGeminiWithImage(
   const memoryInstruction = memoryContext
     ? `Memory Marley yang relevan:\n${memoryContext}\n\n`
     : "";
+  const detectedLanguage = detectMarleyLanguage(prompt || "");
+  const languageBlock = languageInstruction(detectedLanguage);
 
   for (let attempt = 0; attempt < retries; attempt++) {
     try {
@@ -400,7 +499,7 @@ async function askGeminiWithImage(
             parts: [
               {
                 text:
-                  `${memoryInstruction}${
+                  `${languageBlock}${memoryInstruction}${
                     prompt ||
                     "Jelaskan dan analisis isi gambar ini."
                   }`,
