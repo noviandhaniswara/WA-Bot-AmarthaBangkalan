@@ -142,199 +142,6 @@ function normalizeForSearch(value) {
     .replace(/[\u0300-\u036f]/g, "");
 }
 
-// ======================================================
-// LOAN MEMORY MARLEY
-// Database awal: Ops Report Penagihan + Leads
-// Primary key: Customer Number
-// ======================================================
-
-const DATA_DIR = process.env.DATA_DIR || "/app/data";
-const LOAN_MEMORY_RUNTIME_FILE = path.join(DATA_DIR, "loan_memory.json");
-const LOAN_MEMORY_ROOT_FILE = path.join(__dirname, "loan_memory.json");
-const LOAN_MEMORY_SEED_FILE = path.join(__dirname, "seed", "loan_memory.json");
-
-let loanMemory = {
-  version: 1,
-  updated_at: null,
-  area_scope: "Bangkalan",
-  primary_key: "customer_number",
-  records: [],
-};
-
-async function initLoanMemory() {
-  try {
-    await fs.mkdir(DATA_DIR, { recursive: true });
-    let sourceFile = LOAN_MEMORY_RUNTIME_FILE;
-    let raw;
-
-    try {
-      raw = await fs.readFile(sourceFile, "utf8");
-    } catch {
-      const candidates = [LOAN_MEMORY_ROOT_FILE, LOAN_MEMORY_SEED_FILE];
-      for (const candidate of candidates) {
-        try {
-          raw = await fs.readFile(candidate, "utf8");
-          sourceFile = candidate;
-          break;
-        } catch {}
-      }
-      if (!raw) throw new Error("File seed loan_memory.json tidak ditemukan.");
-      await fs.writeFile(LOAN_MEMORY_RUNTIME_FILE, raw, "utf8");
-    }
-
-    const parsed = JSON.parse(raw);
-    if (!parsed || !Array.isArray(parsed.records)) {
-      throw new Error("Format loan_memory.json tidak valid.");
-    }
-
-    loanMemory = parsed;
-    console.log(`Loan Memory siap: ${loanMemory.records.length} customer. Sumber: ${sourceFile}`);
-  } catch (err) {
-    console.error("Gagal menyiapkan Loan Memory:", err);
-    loanMemory = { version: 1, updated_at: null, area_scope: "Bangkalan", primary_key: "customer_number", records: [] };
-  }
-}
-
-function normalizeLoanText(value) {
-  return normalizeForSearch(value)
-    .replace(/[^\p{L}\p{N}\s_-]/gu, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function loanMatches(record, query) {
-  const q = normalizeLoanText(query);
-  if (!q) return false;
-  const customer = normalizeLoanText(record.customer_number);
-  if (customer === q) return true;
-  const haystack = normalizeLoanText([
-    record.nama_mitra, record.customer_number, record.loan_id, record.majelis,
-    record.majelis_id, record.no_hp, record.bp, record.branch
-  ].filter(Boolean).join(" "));
-  return haystack.includes(q);
-}
-
-function searchLoanMemory(query, limit = 5) {
-  const q = String(query || "").trim();
-  if (!q) return [];
-  const exactNumber = loanMemory.records.find(r => String(r.customer_number || "").trim() === q);
-  if (exactNumber) return [exactNumber];
-  return loanMemory.records.filter(r => loanMatches(r, q)).slice(0, limit);
-}
-
-function formatLoanValue(value, fallback = "-") {
-  return value === null || value === undefined || String(value).trim() === "" ? fallback : String(value);
-}
-
-function formatRupiah(value) {
-  const n = Number(value);
-  if (!Number.isFinite(n)) return formatLoanValue(value);
-  return new Intl.NumberFormat("id-ID", { maximumFractionDigits: 0 }).format(n);
-}
-
-function formatLoanRecord(record) {
-  return [
-    `👤 *${formatLoanValue(record.nama_mitra)}*`,
-    `Customer Number : ${formatLoanValue(record.customer_number)}`,
-    `Loan ID        : ${formatLoanValue(record.loan_id)}`,
-    `Majelis        : ${formatLoanValue(record.majelis)}`,
-    `Majelis ID     : ${formatLoanValue(record.majelis_id)}`,
-    `BP             : ${formatLoanValue(record.bp)}`,
-    `Branch         : ${formatLoanValue(record.branch)}`,
-    `Payment Status : ${formatLoanValue(record.payment_status)}`,
-    `Tunggakan      : Rp ${formatRupiah(record.tunggakan)}`,
-    `Weekly Repay   : Rp ${formatRupiah(record.weekly_repayment)}`,
-    `Outstanding    : Rp ${formatRupiah(record.outstanding)}`,
-    `Latest Payment : ${formatLoanValue(record.latest_payment_date)}`,
-    `Jatuh Tempo    : ${formatLoanValue(record.tanggal_jatuh_tempo)}`,
-    `Home Visit     : ${formatLoanValue(record.tanggal_home_visit)}`,
-    `Status HV      : ${formatLoanValue(record.status_home_visit)}`,
-    `Jadwal Kumpul  : ${formatLoanValue(record.jadwal_kumpulan)}`,
-    `No. HP         : ${formatLoanValue(record.no_hp)}`,
-    `Alamat         : ${formatLoanValue(record.address)}`,
-  ].join("\n");
-}
-
-function parseLoanCommand(text) {
-  const cleaned = stripMentions(String(text || "").trim());
-  const m = cleaned.match(/^\/(?:loan|cari)\s+(.+)$/i);
-  return m ? m[1].trim() : null;
-}
-
-function looksLikeLoanQuestion(text) {
-  const q = normalizeForSearch(stripMentions(text));
-  if (!q) return false;
-
-  // Anggap pertanyaan sebagai Loan Memory jika jelas menyebut entitas loan/mitra,
-  // atau jika ada Customer Number yang cukup panjang. Ini diproses sebelum Gemini.
-  const hasLoanKeyword =
-    /\b(?:loan|mitra|nasabah|customer|customer number|nomor customer|id loan|nama mitra|majelis|tunggakan|outstanding|no hp|nomor hp)\b/i.test(q);
-  const hasCustomerNumber = /\b\d{7,12}\b/.test(q);
-  const hasLookupVerb = /\b(?:cek|cari|lihat|tampilkan|data|profil|info|informasi|siapa)\b/i.test(q);
-
-  return hasLoanKeyword || (hasCustomerNumber && hasLookupVerb);
-}
-
-function extractLoanSearchTerm(text) {
-  const raw = stripMentions(String(text || "")).trim();
-  if (!raw) return "";
-
-  // Customer Number selalu diprioritaskan karena merupakan primary key.
-  const customerMatch = raw.match(/\b\d{7,12}\b/);
-  if (customerMatch) return customerMatch[0];
-
-  let q = raw
-    .replace(/^@?marley\b[,:;.!?\-]*\s*/i, "")
-    .replace(/^\s*(?:tolong\s+)?(?:dong\s+)?/i, "")
-    .trim();
-
-  // Bentuk eksplisit: "nama mitra Siti", "customer Siti", "majelis ..."
-  const explicit = q.match(/(?:nama\s+mitra|customer(?:\s+number)?|nomor\s+customer|id\s+loan|loan|majelis)\s*(?:nya|:)?\s+(.+?)(?:\s+(?:dong|ya|yah|please))?$/i);
-  if (explicit?.[1]) {
-    return explicit[1].trim().replace(/[?.!,]+$/, "").trim();
-  }
-
-  // Bentuk umum: "cek/cari/data/profil mitra Siti".
-  const generic = q.match(/(?:cek|cari|lihat|tampilkan|data|profil|info|informasi|siapa)\s+(?:data\s+)?(?:loan|mitra|nasabah|customer)?\s*(?:nya|:)?\s*(.+)$/i);
-  if (generic?.[1]) {
-    const candidate = generic[1].trim().replace(/[?.!,]+$/, "").trim();
-    if (candidate && !/^(?:loan|mitra|nasabah|customer)$/i.test(candidate)) return candidate;
-  }
-
-  return q.replace(/[?.!,]+$/, "").trim();
-}
-
-async function answerLoanQuery(sock, from, query) {
-  const searchTerm = extractLoanSearchTerm(query);
-  const results = searchLoanMemory(searchTerm, 5);
-  if (!results.length) {
-    await sock.sendMessage(from, {
-      text: `🔎 Loan Memory tidak menemukan data untuk *${searchTerm || query}*.\n\nCoba gunakan Customer Number atau Nama Mitra yang lebih lengkap.`,
-    });
-    return true;
-  }
-
-  if (results.length === 1) {
-    await sock.sendMessage(from, {
-      text: `📋 *DATA LOAN MARLEY*\n\n${formatLoanRecord(results[0])}`,
-    });
-    return true;
-  }
-
-  const lines = results.map((r, i) =>
-    `${i + 1}. *${formatLoanValue(r.nama_mitra)}*\n` +
-    `   Customer Number: ${formatLoanValue(r.customer_number)}\n` +
-    `   Loan ID: ${formatLoanValue(r.loan_id)}\n` +
-    `   Majelis: ${formatLoanValue(r.majelis)}\n` +
-    `   Status: ${formatLoanValue(r.payment_status)}`
-  );
-
-  await sock.sendMessage(from, {
-    text: `🔎 Ditemukan *${results.length} data* untuk *${searchTerm || query}*.\n\n${lines.join("\n\n")}\n\nGunakan Customer Number untuk melihat data yang lebih spesifik.`,
-  });
-  return true;
-}
-
 function getRelevantMemories(query, limit = 12) {
   if (!memories.length) return [];
 
@@ -995,441 +802,6 @@ function formatReportStatus(date) {
   );
 }
 
-
-
-
-// ======================================================
-// WOB 6 / DPD 7+
-// "WOB 6" dipakai sebagai sebutan operasional untuk
-// mitra dengan installment fully paid count <= 7 dan
-// payment_min_1x belum bayar.
-// Sumber: file Current yang sedang aktif.
-// Output: kolom K (Majelis) + kolom S (Nama Mitra), per Point.
-// ======================================================
-
-function detectWobColumns(sheet) {
-  const columns = sheet?.columns || [];
-  const normalized = columns.map(c => normalizeHeader(c));
-  const byName = (candidates) => {
-    for (const candidate of candidates) {
-      const i = normalized.indexOf(normalizeHeader(candidate));
-      if (i >= 0) return columns[i];
-    }
-    return null;
-  };
-
-  // User specifically requested physical Excel columns K and S.
-  // If headers are available, K/S are still used as the primary source.
-  const colK = columns[10] || null; // Excel K
-  const colS = columns[18] || null; // Excel S
-
-  return {
-    area: byName(["area_name", "area"]),
-    point: byName(["branch_name", "point", "point_name", "branch"]),
-    installmentPaidCount: byName([
-      "total_settled_installment_fully_paid_count",
-      "settled_installment_fully_paid_count",
-      "total_settled_installment_paid_count"
-    ]),
-    paymentMin1x: byName(["payment_min_1x", "total_payment_min_1x"]),
-    majelis: colK,
-    customer: colS,
-  };
-}
-
-function formatWobReport(from, requestedPoint = null) {
-  const autoState = autoKpiSessions.get(from) || {};
-  const currentSheet = firstSheetFromSession(autoState.current);
-
-  if (!currentSheet) {
-    return "❌ Data *Current* belum tersedia. Upload file Current terlebih dahulu.";
-  }
-
-  const d = detectWobColumns(currentSheet);
-  if (!d.area || !d.point || !d.installmentPaidCount || !d.paymentMin1x || !d.majelis || !d.customer) {
-    return (
-      "❌ Struktur file Current belum sesuai untuk WOB.\n\n" +
-      "Marley membutuhkan: area, point, total_settled_installment_fully_paid_count, " +
-      "payment_min_1x, kolom K (Majelis), dan kolom S (Nama Mitra)."
-    );
-  }
-
-  const targetPoint = requestedPoint ? String(requestedPoint).trim() : null;
-  const targetKey = targetPoint ? normalizePqiText(targetPoint) : null;
-
-  const grouped = new Map();
-
-  for (const row of currentSheet.rows || []) {
-    if (normalizeArea(row[d.area]) !== "bangkalan") continue;
-
-    const point = String(row[d.point] ?? "").trim();
-    if (!point) continue;
-
-    if (targetKey && normalizePqiText(point) !== targetKey) continue;
-
-    const paidCount = toNumber(row[d.installmentPaidCount]);
-    if (paidCount === null || paidCount > 7) continue;
-
-    // "belum bayar" = payment_min_1x bukan Yes.
-    if (isYes(row[d.paymentMin1x])) continue;
-
-    const majelis = String(row[d.majelis] ?? "").trim();
-    const customer = String(row[d.customer] ?? "").trim();
-    if (!majelis || !customer) continue;
-
-    if (!grouped.has(point)) grouped.set(point, []);
-    grouped.get(point).push({ majelis, customer });
-  }
-
-  if (!grouped.size) {
-    return targetPoint
-      ? `✅ *WOB 6 / DPD 7+ — ${targetPoint}*\n\nTidak ditemukan mitra dengan angsuran ≤7 yang belum bayar.`
-      : "✅ *WOB 6 / DPD 7+ — AREA BANGKALAN*\n\nTidak ditemukan mitra dengan angsuran ≤7 yang belum bayar.";
-  }
-
-  const points = [...grouped.keys()].sort((a,b) => a.localeCompare(b, "id"));
-  let total = 0;
-  const lines = [
-    targetPoint
-      ? `📋 *WOB 6 / DPD 7+ — ${points[0]}*`
-      : "📋 *WOB 6 / DPD 7+ — AREA BANGKALAN*",
-    ""
-  ];
-
-  for (const point of points) {
-    const members = grouped.get(point)
-      .sort((a,b) => a.majelis.localeCompare(b.majelis, "id") || a.customer.localeCompare(b.customer, "id"));
-
-    total += members.length;
-
-    if (!targetPoint) lines.push(`*${point}*`);
-    lines.push("| Majelis | Nama Mitra |");
-    lines.push("|---|---|");
-    for (const x of members) {
-      lines.push(`| ${x.majelis.replace(/\|/g, "/")} | ${x.customer.replace(/\|/g, "/")} |`);
-    }
-    lines.push("");
-  }
-
-  lines.push(`*Total WOB 6 / DPD 7+ : ${total} mitra*`);
-  return lines.join("\n").trim();
-}
-
-
-// ======================================================
-// BREAKDOWN BP — CURRENT / DPD 1-30 / DPD 31-90
-// BP selalu diambil dari kolom agent_fullname.
-// Group utama = Point, lalu BP di dalam Point.
-// ======================================================
-
-function detectBreakdownBpColumns(sheet) {
-  const columns = sheet?.columns || [];
-  const normalized = columns.map(c => normalizeHeader(c));
-  const find = (names) => {
-    for (const name of names) {
-      const i = normalized.indexOf(normalizeHeader(name));
-      if (i >= 0) return columns[i];
-    }
-    return null;
-  };
-  return {
-    area: find(["area_name", "area"]),
-    point: find(["branch_name", "point", "point_name", "branch"]),
-    bp: find(["agent_fullname"]),
-    dpdOld: find(["dpd_old"]),
-    paymentMin1x: find(["payment_min_1x", "total_payment_min_1x"]),
-    restructured: find(["is_loan_restructured"]),
-  };
-}
-
-function breakdownBpBucketFromSheet(sheet, pointFilter, minDpd, maxDpd, target) {
-  const d = detectBreakdownBpColumns(sheet);
-  if (!d.area || !d.point || !d.bp || !d.dpdOld || !d.paymentMin1x) {
-    return { error: "Kolom wajib breakdown BP tidak lengkap. Marley membutuhkan area, point, agent_fullname, dpd_old, dan payment_min_1x." };
-  }
-  const grouped = new Map();
-  for (const row of sheet.rows || []) {
-    if (normalizeArea(row[d.area]) !== "bangkalan") continue;
-    if (d.restructured && !isNo(row[d.restructured])) continue;
-    const dpd = toNumber(row[d.dpdOld]);
-    if (dpd === null || dpd < minDpd || dpd > maxDpd) continue;
-    const point = String(row[d.point] ?? "").trim();
-    const bp = String(row[d.bp] ?? "").trim();
-    if (!point || !bp) continue;
-    if (pointFilter && normalizePqiText(point) !== normalizePqiText(pointFilter)) continue;
-    const key = `${point}||${bp}`;
-    let item = grouped.get(key);
-    if (!item) {
-      item = { point, bp, total: 0, paid: 0 };
-      grouped.set(key, item);
-    }
-    item.total++;
-    if (isYes(row[d.paymentMin1x])) item.paid++;
-  }
-  return {
-    items: [...grouped.values()].map(x => ({
-      ...x,
-      unpaid: x.total - x.paid,
-      repayment: x.total ? x.paid / x.total : null,
-      gap: Math.max(0, target - (x.total ? x.paid / x.total : 0)),
-      required: Math.max(0, Math.ceil(target * x.total) - x.paid),
-    }))
-  };
-}
-
-function breakdownBpBucketFromDpd3190(state, pointFilter, target) {
-  if (!state?.dpd31_60 || !state?.dpd61_90) {
-    return { error: "Data DPD 31–60 dan DPD 61–90 belum lengkap. Upload keduanya terlebih dahulu." };
-  }
-  const grouped = new Map();
-  for (const source of [state.dpd31_60, state.dpd61_90]) {
-    for (const sheet of source.sheets || []) {
-      const d = detectBreakdownBpColumns(sheet);
-      if (!d.area || !d.point || !d.bp || !d.dpdOld || !d.paymentMin1x) {
-        return { error: "Kolom wajib breakdown BP tidak lengkap pada file DPD 31–90. Marley membutuhkan area, point, agent_fullname, dpd_old, dan payment_min_1x." };
-      }
-      for (const row of sheet.rows || []) {
-        if (normalizeArea(row[d.area]) !== "bangkalan") continue;
-        if (d.restructured && !isNo(row[d.restructured])) continue;
-        const dpd = toNumber(row[d.dpdOld]);
-        if (dpd === null || dpd < 31 || dpd > 90) continue;
-        const point = String(row[d.point] ?? "").trim();
-        const bp = String(row[d.bp] ?? "").trim();
-        if (!point || !bp) continue;
-        if (pointFilter && normalizePqiText(point) !== normalizePqiText(pointFilter)) continue;
-        const key = `${point}||${bp}`;
-        let item = grouped.get(key);
-        if (!item) {
-          item = { point, bp, total: 0, paid: 0 };
-          grouped.set(key, item);
-        }
-        item.total++;
-        if (isYes(row[d.paymentMin1x])) item.paid++;
-      }
-    }
-  }
-  return {
-    items: [...grouped.values()].map(x => ({
-      ...x,
-      unpaid: x.total - x.paid,
-      repayment: x.total ? x.paid / x.total : null,
-      gap: Math.max(0, target - (x.total ? x.paid / x.total : 0)),
-      required: Math.max(0, Math.ceil(target * x.total) - x.paid),
-    }))
-  };
-}
-
-function parseBreakdownBpCommand(text) {
-  const raw = String(text || "").trim();
-  const m = raw.match(/^\/breakdown\s+bp(?:\s+(.+))?$/i);
-  if (!m) return null;
-  let rest = String(m[1] || "").trim();
-  let bucket = "current";
-  let point = null;
-  const bucketMatch = rest.match(/^(current|cur+ent|dpd\s*0|0|1\s*[-–_]\s*30|dpd\s*1\s*[-–_]\s*30|31\s*[-–_]\s*90|dpd\s*31\s*[-–_]\s*90)(?:\s+(.+))?$/i);
-  if (bucketMatch) {
-    const b = bucketMatch[1].toLowerCase().replace(/\s+/g, "");
-    if (/1[-–_]?30|dpd1[-–_]?30/.test(b)) bucket = "dpd1_30";
-    else if (/31[-–_]?90|dpd31[-–_]?90/.test(b)) bucket = "dpd31_90";
-    else bucket = "current";
-    point = bucketMatch[2]?.trim() || null;
-  } else if (rest) {
-    point = rest;
-  }
-  return { bucket, point };
-}
-
-function formatBreakdownBpReport(from, bucket = "current", requestedPoint = null) {
-  const autoState = autoKpiSessions.get(from) || {};
-  let result;
-  let target;
-  let label;
-
-  if (bucket === "current") {
-    const sheet = firstSheetFromSession(autoState.current);
-    if (!sheet) return "❌ Data Current belum tersedia. Upload file Current terlebih dahulu.";
-    target = KPI_CONFIG.dpd0.target;
-    label = "CURRENT / DPD 0";
-    result = breakdownBpBucketFromSheet(sheet, requestedPoint, 0, 0, target);
-  } else if (bucket === "dpd1_30") {
-    const sheet = firstSheetFromSession(autoState.dpd1_30);
-    if (!sheet) return "❌ Data DPD 1–30 belum tersedia. Upload file DPD 1–30 terlebih dahulu.";
-    target = KPI_CONFIG.dpd1_30.target;
-    label = "DPD 1–30";
-    result = breakdownBpBucketFromSheet(sheet, requestedPoint, 1, 30, target);
-  } else {
-    target = KPI_CONFIG.dpd31_90.target;
-    label = "DPD 31–90";
-    result = breakdownBpBucketFromDpd3190(dpd3190Sessions.get(from), requestedPoint, target);
-  }
-
-  if (result.error) return `❌ ${result.error}`;
-  if (!result.items?.length) {
-    return `ℹ️ Tidak ditemukan data *${label}* untuk${requestedPoint ? ` Point *${requestedPoint}*` : " Area Bangkalan"}.`;
-  }
-
-  const pointMap = new Map();
-  for (const item of result.items) {
-    if (!pointMap.has(item.point)) pointMap.set(item.point, []);
-    pointMap.get(item.point).push(item);
-  }
-  const points = [...pointMap.keys()].sort((a,b) => a.localeCompare(b, "id"));
-  const lines = [
-    `📊 *BREAKDOWN BP — ${label}*`,
-    `Target KPI: *${formatPct(target)}*`,
-    requestedPoint ? `Point: *${requestedPoint}*` : "Area: *Bangkalan*",
-    "",
-  ];
-
-  let areaTotal = 0, areaPaid = 0;
-  for (const point of points) {
-    lines.push(`*${point}*`);
-    const members = pointMap.get(point).sort((a,b) => a.bp.localeCompare(b.bp, "id"));
-    for (const x of members) {
-      areaTotal += x.total;
-      areaPaid += x.paid;
-      const status = x.repayment >= target
-        ? `🟢 tercapai | +${formatPct(x.repayment - target)}`
-        : `🔴 kurang ${formatPct(target - x.repayment)} | perlu +${formatCompactNumber(x.required)} payment`;
-      lines.push(`• *${x.bp}* — ${formatCompactNumber(x.paid)}/${formatCompactNumber(x.total)} = *${formatPct(x.repayment)}* | ${status}`);
-    }
-    lines.push("");
-  }
-
-  const areaRep = areaTotal ? areaPaid / areaTotal : 0;
-  const areaGap = Math.max(0, target - areaRep);
-  const areaRequired = Math.max(0, Math.ceil(target * areaTotal) - areaPaid);
-  lines.push("*TOTAL AREA/POINT TERPILIH*");
-  lines.push(`${formatCompactNumber(areaPaid)}/${formatCompactNumber(areaTotal)} = *${formatPct(areaRep)}* | ${areaRep >= target ? `🟢 tercapai | +${formatPct(areaRep-target)}` : `🔴 kurang ${formatPct(areaGap)} | perlu +${formatCompactNumber(areaRequired)} payment`}`);
-  return lines.join("\n").trim();
-}
-
-function normalizePqiText(v) {
-  return String(v ?? "").toLowerCase().trim().replace(/[^\p{L}\p{N}]+/gu, "");
-}
-
-function parsePqiPointFromQuestion(text) {
-  const q = String(text || "").trim();
-  // Examples:
-  // "Marley Sepulu perlu berapa repayment supaya PQI 92%"
-  // "Marley, Sepulu kurang berapa repayment untuk PQI 92%?"
-  const m = q.match(/(?:marley[\s,;:-]*)?(.*?)\s+(?:perlu|kurang|butuh|butuhkan)\s+berapa\s+(?:repayment|paid|payment)/i);
-  if (m && m[1]) {
-    const raw = m[1].replace(/\b(?:untuk|supaya|agar)\s*$/i, "").trim();
-    return raw.replace(/^pqi\s*/i, "").trim();
-  }
-  const m2 = q.match(/\b(?:point\s+)?([A-Za-zÀ-ÿ0-9 .'-]+?)\s+(?:kurang|perlu|butuh)\b/i);
-  return m2 ? m2[1].trim() : "";
-}
-
-function calculateAdditionalPaidForPqi(p) {
-  const tc = Number(p.current?.total || 0);
-  const pc = Number(p.current?.paid || 0);
-  const t1 = Number(p.d130?.total || 0);
-  const p1 = Number(p.d130?.paid || 0);
-  const t31 = Number(p.d3160?.total || 0);
-  const p31 = Number(p.d3160?.paid || 0);
-  const totalAll = tc + t1 + t31;
-  if (tc <= 0 || totalAll <= 0) return null;
-
-  const target = 0.92;
-  const currentPqi = 0.5 * (pc / tc) + 0.5 * ((pc + p1 + p31) / totalAll);
-  if (currentPqi >= target) {
-    return { currentPqi, needed: 0, addCurrent: 0, add130: 0, add3160: 0 };
-  }
-
-  // One additional paid Current improves both PQI components.
-  const gainCurrent = 0.5 / tc + 0.5 / totalAll;
-  // One additional paid DPD 1–30 or 31–60 improves only component 2.
-  const gainOther = 0.5 / totalAll;
-
-  let remaining = target - currentPqi;
-  const unpaidCurrent = Math.max(0, tc - pc);
-  const unpaid130 = Math.max(0, t1 - p1);
-  const unpaid3160 = Math.max(0, t31 - p31);
-
-  const addCurrent = Math.min(unpaidCurrent, Math.max(0, Math.ceil(remaining / gainCurrent - 1e-12)));
-  remaining -= addCurrent * gainCurrent;
-
-  let add130 = 0;
-  let add3160 = 0;
-  if (remaining > 1e-12) {
-    const otherNeeded = Math.max(0, Math.ceil(remaining / gainOther - 1e-12));
-    add130 = Math.min(unpaid130, otherNeeded);
-    remaining -= add130 * gainOther;
-    if (remaining > 1e-12) {
-      const stillNeeded = Math.max(0, Math.ceil(remaining / gainOther - 1e-12));
-      add3160 = Math.min(unpaid3160, stillNeeded);
-      remaining -= add3160 * gainOther;
-    }
-  }
-
-  const needed = addCurrent + add130 + add3160;
-  const possible = remaining <= 1e-10;
-  return { currentPqi, needed: possible ? needed : null, addCurrent, add130, add3160, possible };
-}
-
-function answerPqiRepaymentQuestion(question, from) {
-  const q = String(question || "");
-  if (!/pqi/i.test(q)) return null;
-  if (!/(?:kurang|perlu|butuh|butuhkan|repayment|paid|payment).*(?:92|0[.,]92)|(?:92|0[.,]92).*(?:kurang|perlu|butuh|repayment|paid|payment)/i.test(q)) return null;
-
-  const built = buildPqiPoints(from);
-  if (!built.ready) {
-    return `📊 *KEBUTUHAN REPAYMENT PQI 92%*\n\nMarley belum bisa menghitung. Data yang diperlukan: *Current + DPD 1–30 + DPD 31–60*.\n\nBelum tersedia: ${built.missing.join(" | ")}`;
-  }
-
-  const requestedPoint = parsePqiPointFromQuestion(q);
-  let rows = built.results || [];
-  if (requestedPoint) {
-    const key = normalizePqiText(requestedPoint);
-    rows = rows.filter(r => normalizePqiText(r.point) === key || normalizePqiText(r.point).includes(key));
-  }
-
-  if (!rows.length) {
-    return `❌ Point *${requestedPoint || "-"}* tidak ditemukan pada data PQI Area Bangkalan.`;
-  }
-
-  const lines = ["🎯 *KEBUTUHAN REPAYMENT PQI 92%*", ""];
-  for (const r of rows) {
-    const calc = calculateAdditionalPaidForPqi(r);
-    if (!calc) continue;
-    const pct = formatPct(calc.currentPqi);
-
-    if (calc.needed === 0) {
-      lines.push(
-        `🟢 *${r.point}* — PQI ${pct}`,
-        `Sudah mencapai target 92%.`,
-        ""
-      );
-      continue;
-    }
-
-    if (calc.needed === null) {
-      lines.push(
-        `🔴 *${r.point}* — PQI ${pct}`,
-        `Belum mencapai 92% dan jumlah loan unpaid pada bucket yang tersedia tidak cukup untuk menutup gap.`,
-        ""
-      );
-      continue;
-    }
-
-    const detail = [];
-    if (calc.addCurrent) detail.push(`Current ${calc.addCurrent}`);
-    if (calc.add130) detail.push(`DPD 1–30 ${calc.add130}`);
-    if (calc.add3160) detail.push(`DPD 31–60 ${calc.add3160}`);
-
-    lines.push(
-      `🔴 *${r.point}* — PQI ${pct}`,
-      `Target        : 92,00%`,
-      `Kurang        : *${calc.needed} repayment*`,
-      `Komposisi min. : ${detail.join(" + ")}`,
-      ""
-    );
-  }
-  return lines.join("\n").trim();
-}
-
 async function processIncomingDailyReport(sock, from, sender, text) {
   const report = parseDailyReport(text);
   if (!report) return false;
@@ -1467,6 +839,255 @@ async function processIncomingDailyReport(sock, from, sender, text) {
 }
 
 
+
+// ======================================================
+// PORTFOLIO DATABASE V1 — PERSISTENT RAILWAY VOLUME
+// Source utama: Ops Report Penagihan (CSV/XLSX).
+// Database tidak menghapus record lama hanya karena tidak muncul
+// pada report terbaru. Record yang tidak muncul diberi status
+// MISSING_FROM_LATEST_REPORT agar tidak salah dianggap lunas.
+// ======================================================
+const PORTFOLIO_DATA_DIR = process.env.PORTFOLIO_DATA_DIR || path.join(__dirname, "data");
+const LOAN_MEMORY_FILE = path.join(PORTFOLIO_DATA_DIR, "loan_memory.json");
+const LOAN_HISTORY_FILE = path.join(PORTFOLIO_DATA_DIR, "loan_sync_history.json");
+
+let loanMemory = { version: 1, updatedAt: null, customers: {}, loans: {} };
+let loanHistory = [];
+let loanDbWriteQueue = Promise.resolve();
+
+async function initPortfolioDatabase() {
+  await fs.mkdir(PORTFOLIO_DATA_DIR, { recursive: true });
+  try {
+    loanMemory = JSON.parse(await fs.readFile(LOAN_MEMORY_FILE, "utf8"));
+    if (!loanMemory || typeof loanMemory !== "object" || !loanMemory.loans) throw new Error("invalid loan_memory");
+  } catch {
+    loanMemory = { version: 1, updatedAt: null, customers: {}, loans: {} };
+    await savePortfolioDatabase();
+  }
+  try {
+    const parsed = JSON.parse(await fs.readFile(LOAN_HISTORY_FILE, "utf8"));
+    loanHistory = Array.isArray(parsed) ? parsed : [];
+  } catch {
+    loanHistory = [];
+    await saveLoanHistory();
+  }
+  console.log(`Portfolio Database siap: ${Object.keys(loanMemory.loans).length} loan.`);
+}
+
+function savePortfolioDatabase() {
+  loanMemory.updatedAt = new Date().toISOString();
+  const payload = JSON.stringify(loanMemory, null, 2);
+  loanDbWriteQueue = loanDbWriteQueue.catch(() => {}).then(() => fs.writeFile(LOAN_MEMORY_FILE, payload, "utf8"));
+  return loanDbWriteQueue;
+}
+
+function saveLoanHistory() {
+  const payload = JSON.stringify(loanHistory.slice(-2000), null, 2);
+  loanDbWriteQueue = loanDbWriteQueue.catch(() => {}).then(() => fs.writeFile(LOAN_HISTORY_FILE, payload, "utf8"));
+  return loanDbWriteQueue;
+}
+
+function normalizeDbKey(value) {
+  return String(value ?? "").trim().toLowerCase();
+}
+
+function cleanDbValue(value) {
+  if (value === undefined || value === null) return null;
+  if (value instanceof Date) return value.toISOString();
+  return typeof value === "string" ? value.trim() : value;
+}
+
+function detectPortfolioColumns(columns) {
+  const find = (cands) => findColumn(columns, cands);
+  return {
+    area: find(["area_name", "area"]),
+    point: find(["branch_name", "point", "point_name", "branch"]),
+    bp: find(["agent_fullname", "bp_username", "bp_name", "bp"]),
+    customerNumber: find(["customer_number", "customer_no", "customer_number_id"]),
+    customerName: find(["customer_name", "nama_mitra", "mitra_name"]),
+    loanId: find(["loan_id", "loanid", "id_loan"]),
+    dpdOld: find(["dpd_old"]),
+    dpdNew: find(["dpd_new"]),
+    osOld: find(["os_old"]),
+    osNew: find(["os_new"]),
+    totalTunggakan: find(["total_tunggakan", "arrears", "tunggakan"]),
+    totalPayment: find(["total_payment", "payment"]),
+    totalPaymentMin1x: find(["total_payment_min_1x"]),
+    paymentMin1x: find(["payment_min_1x"]),
+    restructured: find(["is_loan_restructured"]),
+    movement: find(["movement_label"]),
+  };
+}
+
+function isOpsPortfolioSourceName(name) {
+  const s = String(name || "").toLowerCase();
+  return /ops\s*report|ops_report|penagihan|portfolio|portofolio/.test(s);
+}
+
+function portfolioAreaIsBangkalan(value) {
+  return normalizeArea(value) === "bangkalan";
+}
+
+function rowToPlainObject(row) {
+  const out = {};
+  for (const [k, v] of Object.entries(row || {})) out[k] = cleanDbValue(v);
+  return out;
+}
+
+function portfolioRecordFromRow(row, d, sourceName, sourceDate) {
+  const loanId = cleanDbValue(row[d.loanId]);
+  const customerNumber = cleanDbValue(row[d.customerNumber]);
+  const key = normalizeDbKey(loanId || `${customerNumber || "unknown"}|${row[d.customerName] || ""}`);
+  return {
+    key,
+    loanId,
+    customerNumber,
+    customerName: cleanDbValue(row[d.customerName]),
+    area: cleanDbValue(row[d.area]),
+    point: cleanDbValue(row[d.point]),
+    bp: cleanDbValue(row[d.bp]),
+    dpdOld: toNumber(row[d.dpdOld]),
+    dpdNew: toNumber(row[d.dpdNew]),
+    osOld: toNumber(row[d.osOld]),
+    osNew: toNumber(row[d.osNew]),
+    totalTunggakan: toNumber(row[d.totalTunggakan]),
+    totalPayment: toNumber(row[d.totalPayment]),
+    totalPaymentMin1x: toNumber(row[d.totalPaymentMin1x]),
+    paymentMin1x: row[d.paymentMin1x] == null ? null : String(row[d.paymentMin1x]).trim(),
+    isLoanRestructured: row[d.restructured] == null ? null : String(row[d.restructured]).trim(),
+    movementLabel: cleanDbValue(row[d.movement]),
+    sourceName,
+    sourceDate,
+    lastSeenAt: new Date().toISOString(),
+    status: "ACTIVE",
+  };
+}
+
+function makePortfolioFingerprint(sourceName, rows, sourceDate) {
+  const first = rows[0] || {};
+  const last = rows[rows.length - 1] || {};
+  return [sourceName, sourceDate || "", rows.length, JSON.stringify(first), JSON.stringify(last)].join("|");
+}
+
+async function syncOpsReportToPortfolioDatabase(buffer, sourceName) {
+  const workbook = XLSX.read(buffer, { type: "buffer", cellDates: true, raw: true });
+  const sheets = workbook.SheetNames || [];
+  let totalRows = 0, bangkalanRows = 0, added = 0, updated = 0, skipped = 0;
+  const seenKeys = new Set();
+  let detected = null;
+  let sourceDate = new Date().toISOString().slice(0, 10);
+
+  for (const sheetName of sheets) {
+    const ws = workbook.Sheets[sheetName];
+    const raw = XLSX.utils.sheet_to_json(ws, { header: 1, defval: null, raw: true });
+    if (!raw.length) continue;
+    const headers = raw[0].map(normalizeHeader);
+    const rows = normalizeRows(raw);
+    const d = detectPortfolioColumns(headers);
+    if (!d.loanId && !d.customerNumber) continue;
+    if (!d.area) continue;
+    detected = d;
+    totalRows += rows.length;
+
+    for (const row of rows) {
+      if (!portfolioAreaIsBangkalan(row[d.area])) continue;
+      bangkalanRows++;
+      const record = portfolioRecordFromRow(row, d, sourceName, sourceDate);
+      if (!record.key || record.key === "unknown|") { skipped++; continue; }
+      seenKeys.add(record.key);
+      const previous = loanMemory.loans[record.key];
+      if (previous) {
+        loanMemory.loans[record.key] = { ...previous, ...record, status: "ACTIVE", updatedAt: new Date().toISOString() };
+        updated++;
+      } else {
+        loanMemory.loans[record.key] = { ...record, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
+        added++;
+      }
+
+      if (record.customerNumber) {
+        const ck = normalizeDbKey(record.customerNumber);
+        loanMemory.customers[ck] = {
+          ...(loanMemory.customers[ck] || {}),
+          customerNumber: record.customerNumber,
+          customerName: record.customerName,
+          point: record.point,
+          bp: record.bp,
+          area: record.area,
+          loanIds: Array.from(new Set([...(loanMemory.customers[ck]?.loanIds || []), record.loanId].filter(Boolean))),
+          updatedAt: new Date().toISOString(),
+        };
+      }
+    }
+  }
+
+  if (!detected) throw new Error("Kolom Loan ID/Customer Number dan Area tidak ditemukan. File tidak disimpan sebagai Ops Report.");
+
+  // Jangan menganggap record yang hilang sebagai lunas. Tandai saja sebagai missing.
+  for (const [key, loan] of Object.entries(loanMemory.loans)) {
+    if (loan.area && portfolioAreaIsBangkalan(loan.area) && !seenKeys.has(key)) {
+      if (loan.status !== "PAID") loan.status = "MISSING_FROM_LATEST_REPORT";
+    }
+  }
+
+  const fingerprint = makePortfolioFingerprint(sourceName, Object.values(loanMemory.loans).slice(-Math.min(bangkalanRows, 20)), sourceDate);
+  const already = loanHistory.find((x) => x.fingerprint === fingerprint);
+  if (!already) {
+    loanHistory.push({
+      syncedAt: new Date().toISOString(),
+      sourceName,
+      sourceDate,
+      totalRows,
+      bangkalanRows,
+      added,
+      updated,
+      skipped,
+      fingerprint,
+    });
+  }
+
+  await savePortfolioDatabase();
+  await saveLoanHistory();
+
+  return { totalRows, bangkalanRows, added, updated, skipped, totalLoans: Object.keys(loanMemory.loans).length, customers: Object.keys(loanMemory.customers).length, sourceDate };
+}
+
+function portfolioDatabaseStatus() {
+  const loans = Object.values(loanMemory.loans);
+  const active = loans.filter(x => x.status === "ACTIVE").length;
+  const missing = loans.filter(x => x.status === "MISSING_FROM_LATEST_REPORT").length;
+  const points = new Set(loans.filter(x => portfolioAreaIsBangkalan(x.area)).map(x => x.point).filter(Boolean));
+  return `🗄️ *PORTFOLIO DATABASE MARLEY*\n\nLoan tersimpan: ${loans.length.toLocaleString("id-ID")}\nCustomer: ${Object.keys(loanMemory.customers).length.toLocaleString("id-ID")}\nAktif di report terakhir: ${active.toLocaleString("id-ID")}\nTidak muncul di report terakhir: ${missing.toLocaleString("id-ID")}\nPoint: ${points.size}\nUpdate terakhir: ${loanMemory.updatedAt || "belum ada"}`;
+}
+
+function portfolioDatabaseFind(query) {
+  const q = normalizeDbKey(query);
+  if (!q) return [];
+  const out = [];
+  for (const loan of Object.values(loanMemory.loans)) {
+    const hay = [loan.loanId, loan.customerNumber, loan.customerName, loan.point, loan.bp].map(normalizeDbKey).join(" | ");
+    if (hay.includes(q)) out.push(loan);
+  }
+  return out.slice(0, 20);
+}
+
+function formatPortfolioLoan(loan) {
+  return `Loan: ${loan.loanId || "-"}\nMitra: ${loan.customerName || "-"}\nCustomer No: ${loan.customerNumber || "-"}\nPoint: ${loan.point || "-"}\nBP: ${loan.bp || "-"}\nDPD: ${loan.dpdOld ?? "-"} → ${loan.dpdNew ?? "-"}\nOS: ${formatMoney(loan.osNew)}\nPayment ≥1x: ${loan.paymentMin1x || "-"}\nStatus DB: ${loan.status || "-"}`;
+}
+
+async function processOpsReportUpload(sock, from, msg, filename) {
+  try {
+    await sock.sendMessage(from, { text: `🗄️ Marley menyimpan *${filename}* ke Portfolio Database...` });
+    const buffer = await downloadMediaMessage(msg, "buffer", {});
+    const result = await syncOpsReportToPortfolioDatabase(buffer, filename);
+    await sock.sendMessage(from, { text: `✅ *OPS REPORT TERSIMPAN*\n\nBangkalan: ${result.bangkalanRows.toLocaleString("id-ID")} baris\n➕ Baru: ${result.added.toLocaleString("id-ID")}\n🔄 Diperbarui: ${result.updated.toLocaleString("id-ID")}\n⚠️ Dilewati: ${result.skipped.toLocaleString("id-ID")}\n\nTotal loan di database: ${result.totalLoans.toLocaleString("id-ID")}\nCustomer: ${result.customers.toLocaleString("id-ID")}\n\nRecord yang tidak muncul pada report terbaru *tidak dianggap lunas*.` });
+    return true;
+  } catch (err) {
+    console.error("Ops Report DB sync error:", err);
+    await sock.sendMessage(from, { text: `❌ Gagal menyimpan Ops Report ke database.\n${err.message}` });
+    return true;
+  }
+}
+
 // ======================================================
 // EXCEL / CSV / GOOGLE SHEETS ENGINE V4.1
 // Deterministic operational analytics first; Gemini only for
@@ -1474,8 +1095,6 @@ async function processIncomingDailyReport(sock, from, sender, text) {
 // ======================================================
 
 const spreadsheetSessions = new Map();
-const autoKpiSessions = new Map();
-const dpd3190Sessions = new Map();
 const kpDailySessions = new Map();
 const SPREADSHEET_DIR = path.join(__dirname, "data", "spreadsheet_cache");
 
@@ -1528,7 +1147,6 @@ function findColumn(columns, candidates) {
 
 function detectDatasetColumns(columns) {
   return {
-    area: findColumn(columns, ["area_name", "area", "regional_area", "region_area", "nama_area"]),
     point: findColumn(columns, ["branch_name", "point", "point_name", "branch"]),
     bp: findColumn(columns, ["bp_username", "agent_fullname", "bp_name", "bp"]),
     customer: findColumn(columns, ["customer_name", "customer", "mitra_name"]),
@@ -1544,7 +1162,6 @@ function detectDatasetColumns(columns) {
     loanState: findColumn(columns, ["loan_state"]),
     loanKind: findColumn(columns, ["loan_kind"]),
     group: findColumn(columns, ["group_name"]),
-    restructured: findColumn(columns, ["is_loan_restructured", "loan_restructured", "is_restructured"]),
   };
 }
 
@@ -1747,326 +1364,22 @@ async function loadPublicGoogleSheet(url) {
   return loadSpreadsheetBuffer(buffer, `Google Sheets (${info.id})`);
 }
 
-function detectAutoKpiFileType(filename, caption = "") {
-  const s = `${String(filename || "")} ${String(caption || "")}`.toLowerCase();
-  if (/dpd[\s_-]*1[\s_-]*30|1[\s_-]*30/.test(s)) return "dpd1_30";
-  if (/cur+ent|dpd[\s_-]*0|0[\s_-]*dpd/.test(s)) return "current";
-  return null;
-}
-
-function detectDpd3190FileType(filename, caption = "") {
-  const s = `${String(filename || "")} ${String(caption || "")}`.toLowerCase();
-  if (/dpd[\s_-]*31[\s_-]*60|31[\s_-]*60/.test(s)) return "dpd31_60";
-  if (/dpd[\s_-]*61[\s_-]*90|61[\s_-]*90/.test(s)) return "dpd61_90";
-  return null;
-}
-
-function repaymentForDpd3190Sheets(sources) {
-  let total = 0, paid = 0, paymentAmount = 0, os = 0, arrears = 0;
-  const movement = new Map();
-  const byPoint = new Map();
-  let missingArea = false;
-
-  // Each uploaded source is a workbook session ({ sheets: [...] }).
-  // Flatten its sheets first so the engine never mistakes session metadata
-  // (sourceName/loadedAt/sheets) for a spreadsheet row set.
-  for (const [bucket, source] of Object.entries(sources || {})) {
-    if (!source) continue;
-    const sourceSheets = Array.isArray(source.sheets) ? source.sheets : [source];
-    for (const sheet of sourceSheets) {
-      if (!sheet) continue;
-      const d = sheet.detected || detectDatasetColumns(sheet.columns || []);
-    if (!d.area || !d.dpdOld || !d.paymentMin1x || !d.restructured) {
-      missingArea = true;
-      continue;
-    }
-    for (const r of sheet.rows || []) {
-      if (normalizeArea(r[d.area]) !== "bangkalan") continue;
-      if (!isNo(r[d.restructured])) continue;
-      const dpd = toNumber(r[d.dpdOld]);
-      if (dpd === null || dpd < 31 || dpd > 90) continue;
-      const point = d.point ? String(r[d.point] ?? "").trim() : "-";
-      const paidRow = isYes(r[d.paymentMin1x]);
-      total++;
-      if (paidRow) paid++;
-      if (d.payment) paymentAmount += toNumber(r[d.payment]) || 0;
-      if (d.osNew) os += toNumber(r[d.osNew]) || 0;
-      if (d.arrears) arrears += toNumber(r[d.arrears]) || 0;
-      const label = d.movement ? String(r[d.movement] ?? "").trim() : "";
-      if (label) movement.set(label, (movement.get(label) || 0) + 1);
-      const current = byPoint.get(point) || { total: 0, paid: 0 };
-      current.total++;
-      if (paidRow) current.paid++;
-      byPoint.set(point, current);
-      }
-    }
-  }
-  return {
-    total, paid, unpaid: total - paid, repayment: total ? paid / total : null,
-    paymentAmount, os, arrears, missingArea,
-    movement: [...movement.entries()].sort((a,b) => b[1]-a[1]),
-    byPoint: [...byPoint.entries()].map(([point,v]) => ({ point, ...v, repayment: v.total ? v.paid/v.total : null }))
-      .sort((a,b) => (a.repayment ?? 1) - (b.repayment ?? 1))
-  };
-}
-
-
-const PQI_CONFIG = { target: 0.92 };
-
-function firstSheetFromSession(session) {
-  return activeSheetFor(session);
-}
-
-function pqiBucketFromSheet(sheet, pointFilter = null, minDpd = 0, maxDpd = 0) {
-  if (!sheet?.detected) return null;
-  const d = sheet.detected;
-  if (!d.area || !d.point || !d.paymentMin1x || !d.dpdOld || !d.restructured) return null;
-  const rows = (sheet.rows || []).filter((r) => {
-    if (normalizeArea(r[d.area]) !== "bangkalan") return false;
-    if (pointFilter !== null && String(r[d.point] ?? "").trim() !== String(pointFilter).trim()) return false;
-    if (d.restructured && !isNo(r[d.restructured])) return false;
-    const dpd = toNumber(r[d.dpdOld]);
-    return dpd !== null && dpd >= minDpd && dpd <= maxDpd;
-  });
-  let paid = 0;
-  for (const r of rows) if (isYes(r[d.paymentMin1x])) paid++;
-  return { total: rows.length, paid };
-}
-
-function pqiPointData(state, pointFilter = null) {
-  const autoState = autoKpiSessions.get(state.from) || {};
-  const currentSheet = firstSheetFromSession(autoState.current);
-  const dpd3190 = dpd3190Sessions.get(state.from);
-  const sheet3160 = firstSheetFromSession(dpd3190?.dpd31_60);
-  const sheet130 = firstSheetFromSession(autoState.dpd1_30);
-  if (!currentSheet || !sheet130 || !sheet3160) return null;
-
-  const current = pqiBucketFromSheet(currentSheet, pointFilter, 0, 0);
-  const d130 = pqiBucketFromSheet(sheet130, pointFilter, 1, 30);
-  const d3160 = pqiBucketFromSheet(sheet3160, pointFilter, 31, 60);
-  if (!current || !d130 || !d3160) return null;
-
-  const c1 = current.total ? current.paid / current.total : null;
-  const denom2 = current.total + d130.total + d3160.total;
-  const numer2 = current.paid + d130.paid + d3160.paid;
-  const c2 = denom2 ? numer2 / denom2 : null;
-  const pqi = Number.isFinite(c1) && Number.isFinite(c2) ? (0.5 * c1) + (0.5 * c2) : null;
-  return { point: pointFilter, current, d130, d3160, component1: c1, component2: c2, pqi };
-}
-
-function buildPqiPoints(from) {
-  const autoState = autoKpiSessions.get(from) || {};
-  const state3190 = dpd3190Sessions.get(from);
-  const currentSheet = firstSheetFromSession(autoState.current);
-  const sheet130 = firstSheetFromSession(autoState.dpd1_30);
-  const sheet3160 = firstSheetFromSession(state3190?.dpd31_60);
-  if (!currentSheet || !sheet130 || !sheet3160) {
-    return { ready: false, missing: [
-      !currentSheet ? "Current" : null,
-      !sheet130 ? "DPD 1–30" : null,
-      !sheet3160 ? "DPD 31–60" : null,
-    ].filter(Boolean) };
-  }
-  const d = currentSheet.detected || {};
-  const d1 = sheet130.detected || {};
-  const d31 = sheet3160.detected || {};
-  const required = [d,d1,d31].every(x => x.area && x.point && x.dpdOld && x.paymentMin1x && x.restructured);
-  if (!required) return { ready: false, missing: ["kolom wajib PQI" ] };
-
-  const pointSet = new Set();
-  for (const [sheet, det, min, max] of [[currentSheet,d,0,0],[sheet130,d1,1,30],[sheet3160,d31,31,60]]) {
-    for (const r of sheet.rows || []) {
-      if (normalizeArea(r[det.area]) !== "bangkalan") continue;
-      if (det.restructured && !isNo(r[det.restructured])) continue;
-      const dpd = toNumber(r[det.dpdOld]);
-      if (dpd === null || dpd < min || dpd > max) continue;
-      const point = String(r[det.point] ?? "").trim();
-      if (point) pointSet.add(point);
-    }
-  }
-  const points = [...pointSet];
-  const results = [];
-  for (const point of points) {
-    const row = pqiPointData({ from }, point);
-    if (!row || !row.current.total && !row.d130.total && !row.d3160.total) continue;
-    results.push(row);
-  }
-  results.sort((a,b) => (a.pqi ?? 0) - (b.pqi ?? 0));
-  return { ready: true, results };
-}
-
-function formatPqiReport(from, requestedPoint = null) {
-  const built = buildPqiPoints(from);
-  if (!built.ready) {
-    return `📊 *PQI AREA BANGKALAN*\n\nMarley belum bisa menghitung PQI. Data yang diperlukan: *Current + DPD 1–30 + DPD 31–60*.\n\nBelum tersedia: ${built.missing.join(" | ")}`;
-  }
-  let rows = built.results;
-  if (requestedPoint) rows = rows.filter(x => x.point.toLowerCase() === requestedPoint.toLowerCase());
-  if (!rows.length) return requestedPoint ? `❌ Point *${requestedPoint}* tidak ditemukan pada data PQI Area Bangkalan.` : "❌ Tidak ada Point Area Bangkalan yang dapat dihitung.";
-
-  const lines = rows.map((x, i) => {
-    const status = x.pqi >= PQI_CONFIG.target ? "🟢 Aspiration" : "🔴 Underperform Collection";
-    return `${i + 1}. *${x.point}* — *${formatPct(x.pqi)}* | ${status}`;
-  });
-  let out = `📊 *PQI AREA BANGKALAN*\nTarget: *${formatPct(PQI_CONFIG.target)}*\n\n${lines.join("\n")}`;
-  if (requestedPoint) {
-    const x = rows[0];
-    out += `\n\n*BREAKDOWN ${x.point.toUpperCase()}*\n` +
-      `Current : ${formatCompactNumber(x.current.paid)}/${formatCompactNumber(x.current.total)} paid\n` +
-      `DPD 1–30 : ${formatCompactNumber(x.d130.paid)}/${formatCompactNumber(x.d130.total)} paid\n` +
-      `DPD 31–60 : ${formatCompactNumber(x.d3160.paid)}/${formatCompactNumber(x.d3160.total)} paid\n` +
-      `PQI Komponen 1 : ${formatPct(x.component1)}\n` +
-      `PQI Komponen 2 : ${formatPct(x.component2)}\n` +
-      `PQI : *${formatPct(x.pqi)}*`;
-  }
-  return out;
-}
-
-function formatDpd3190Report(state, includePoints = true) {
-  if (!state?.dpd31_60 || !state?.dpd61_90) {
-    const ready = [state?.dpd31_60 ? "31–60 ✓" : "31–60 ✗", state?.dpd61_90 ? "61–90 ✓" : "61–90 ✗"].join(" | ");
-    return `📊 *DPD 31–90*\n\nSumber: ${ready}\n\nMarley menunggu kedua file untuk menghitung DPD 31–90.`;
-  }
-  const r = repaymentForDpd3190Sheets(state);
-  if (r.missingArea) return "❌ Kolom wajib (area_name, dpd_old, payment_min_1x, is_loan_restructured) tidak lengkap pada salah satu file. Marley tidak akan menghitung data yang belum terverifikasi.";
-  if (!r.total) return "❌ Data DPD 31–90 Area Bangkalan tidak ditemukan setelah filter restruktur NO.";
-  const target = KPI_CONFIG.dpd31_90.target;
-  const gap = Math.max(0, target - r.repayment);
-  const required = Math.max(0, Math.ceil(target * r.total) - r.paid);
-  const status = r.repayment >= target ? `✅ Tercapai | Lebih ${formatPct(r.repayment-target)}` : `⚠️ Kurang ${formatPct(gap)} | Tambahan min. ${formatCompactNumber(required)} payment`;
-  let out = `🎯 *REPAYMENT DPD 31–90*\nTarget KPI: *${formatPct(target)}*\n\nTotal Loan : ${formatCompactNumber(r.total)}\nPayment ≥1x : ${formatCompactNumber(r.paid)}\nBelum Payment : ${formatCompactNumber(r.unpaid)}\nRepayment : *${formatPct(r.repayment)}*\nStatus : ${status}\nOS New : ${formatMoney(r.os)}`;
-  if (includePoints && r.byPoint.length) {
-    out += `\n\n*PER POINT*\n` + r.byPoint.map((x,i) => `${i+1}. *${x.point || "-"}* — ${formatCompactNumber(x.paid)}/${formatCompactNumber(x.total)} = *${formatPct(x.repayment)}*`).join("\n");
-  }
-  if (r.movement.length) out += `\n\n*MOVEMENT*\n` + r.movement.slice(0,10).map(([k,v]) => `• ${k}: ${formatCompactNumber(v)}`).join("\n");
-  return out;
-}
-
-function answerDpd3190Question(state, question) {
-  if (!state?.dpd31_60 || !state?.dpd61_90) return formatDpd3190Report(state, false);
-  const q = String(question || "").toLowerCase();
-  const r = repaymentForDpd3190Sheets(state);
-  if (r.missingArea) return "❌ Kolom wajib (area_name, dpd_old, payment_min_1x, is_loan_restructured) tidak lengkap pada salah satu file. Marley tidak akan menghitung data yang belum terverifikasi.";
-  if (!r.total) return "❌ Data DPD 31–90 Area Bangkalan tidak ditemukan setelah filter restruktur NO.";
-  if (/flow.*90|90\+|lebih.*90|to.*>90|to 90/.test(q)) {
-    const x = r.movement.filter(([k]) => />?\s*90|90\s*\+|to\s*90/i.test(k)).reduce((s, [,v]) => s+v, 0);
-    return `📌 *FLOW KE 90+*\n\nArea Bangkalan: *${formatCompactNumber(x)} loan*`;
-  }
-  if (/stay.*61|61.?90.*stay/.test(q)) {
-    const x = r.movement.filter(([k]) => /stay.*61.?90/i.test(k)).reduce((s, [,v]) => s+v, 0);
-    return `📌 *STAY 61–90*\n\nArea Bangkalan: *${formatCompactNumber(x)} loan*`;
-  }
-  if (/movement|pergerakan|flow|stay|rollback/.test(q)) {
-    return `🔄 *MOVEMENT DPD 31–90*\n\n${r.movement.map(([k,v]) => `• ${k}: ${formatCompactNumber(v)}`).join("\n")}`;
-  }
-  if (/point.*(tertinggi|terendah)|per point|ranking/.test(q)) {
-    return `📊 *DPD 31–90 PER POINT*\n\n${r.byPoint.map((x,i) => `${i+1}. *${x.point || "-"}* — ${formatCompactNumber(x.paid)}/${formatCompactNumber(x.total)} = *${formatPct(x.repayment)}*`).join("\n")}`;
-  }
-  if (/os|outstanding/.test(q)) return `💰 *OS DPD 31–90 Area Bangkalan*\n\n${formatMoney(r.os)}`;
-  if (/jumlah|berapa.*loan|berapa.*mitra|total/.test(q)) return `🔢 *TOTAL DPD 31–90*\n\nLoan: ${formatCompactNumber(r.total)}\nPayment ≥1x: ${formatCompactNumber(r.paid)}\nBelum Payment: ${formatCompactNumber(r.unpaid)}`;
-  return formatDpd3190Report(state, true);
-}
-
-function bangkalanRowsForAuto(sheet) {
-  const d = sheet.detected || {};
-  if (!d.area) return null;
-  return (sheet.rows || []).filter((r) => normalizeArea(r[d.area]) === "bangkalan");
-}
-
-function repaymentBucketForAuto(sheet, pointFilter, minDpd, maxDpd) {
-  const d = sheet.detected || {};
-  if (!d.dpdOld || !d.paymentMin1x || !d.area) return null;
-  const bangkalanRows = bangkalanRowsForAuto(sheet);
-  if (!bangkalanRows) return null;
-  const rows = pointFilter == null
-    ? bangkalanRows
-    : bangkalanRows.filter((r) => String(r[d.point] ?? "").trim() === String(pointFilter).trim());
-  let total = 0, paid = 0;
-  for (const r of rows) {
-    if (d.restructured && !isNo(r[d.restructured])) continue;
-    const dpd = toNumber(r[d.dpdOld]);
-    if (dpd === null || dpd < minDpd || dpd > maxDpd) continue;
-    total++;
-    if (isYes(r[d.paymentMin1x])) paid++;
-  }
-  return { total, paid, unpaid: total - paid, repayment: total ? paid / total : null };
-}
-
-function formatAutoRepaymentReport(sheet, type) {
-  const minDpd = type === "current" ? 0 : 1;
-  const maxDpd = type === "current" ? 0 : 30;
-  const target = type === "current" ? 0.98 : 0.55;
-  const title = type === "current" ? "REPAYMENT CURRENT / DPD 0 PER POINT" : "REPAYMENT DPD 1–30 PER POINT";
-  if (!sheet.detected?.area) return "❌ Kolom area tidak ditemukan, jadi Marley tidak dapat memastikan filter Area Bangkalan.";
-  if (!sheet.detected?.point) return "❌ Kolom point tidak ditemukan.";
-  const bangkalanRows = bangkalanRowsForAuto(sheet);
-  if (!bangkalanRows?.length) return "❌ Tidak ditemukan data Area Bangkalan pada file ini.";
-  const points = uniqueValues({ ...sheet, rows: bangkalanRows }, sheet.detected.point);
-  const results = [];
-  for (const point of points) {
-    const r = repaymentBucketForAuto(sheet, point, minDpd, maxDpd);
-    if (!r || !r.total) continue;
-    const gap = Math.max(0, target - r.repayment);
-    const required = Math.max(0, Math.ceil(target * r.total) - r.paid);
-    results.push({ point, ...r, gap, required });
-  }
-  results.sort((a,b) => a.repayment - b.repayment);
-  const area = repaymentBucketForAuto(sheet, null, minDpd, maxDpd);
-  if (!area || !area.total) return `❌ Data ${type === "current" ? "Current / DPD 0" : "DPD 1–30"} tidak ditemukan.`;
-  const lines = results.map((r,i) => {
-    const status = r.gap > 0 ? `⚠️ Kurang ${formatPct(r.gap)} | Tambahan min. ${formatCompactNumber(r.required)} payment` : `✅ Tercapai | Lebih ${formatPct(r.repayment - target)}`;
-    return `${i+1}. *${r.point}* — ${formatCompactNumber(r.paid)}/${formatCompactNumber(r.total)} = *${formatPct(r.repayment)}* | ${status}`;
-  });
-  const areaGap = Math.max(0, target - area.repayment);
-  const areaRequired = Math.max(0, Math.ceil(target * area.total) - area.paid);
-  const areaStatus = areaGap > 0 ? `⚠️ Kurang ${formatPct(areaGap)} | Tambahan min. ${formatCompactNumber(areaRequired)} payment` : `✅ Tercapai | Lebih ${formatPct(area.repayment - target)}`;
-  return `⚡ *${title}*\nTarget KPI: *${formatPct(target)}*\n\n${lines.join("\n")}\n\n*TOTAL AREA*\n${formatCompactNumber(area.paid)}/${formatCompactNumber(area.total)} = *${formatPct(area.repayment)}* | ${areaStatus}`;
-}
-
 async function processSpreadsheetUpload(sock, from, msg, caption = "") {
   const document = msg.message?.documentMessage || msg.message?.documentWithCaptionMessage?.message?.documentMessage;
   if (!document) return false;
   const isGroup = from.endsWith("@g.us");
+  const allowedCaption = !isGroup || containsBotTrigger(caption) || /^\s*\/excel\b/i.test(caption);
+  if (!allowedCaption) return false;
   const filename = document.fileName || "spreadsheet";
   const mime = document.mimetype || "application/octet-stream";
   if (!/\.(xlsx|xls|csv)$/i.test(filename) && !/spreadsheet|excel|csv/i.test(mime)) return false;
-  const autoKpiType = detectAutoKpiFileType(filename, caption);
-  const dpd3190Type = detectDpd3190FileType(filename, caption);
-  console.log(`[AUTO KPI] file=${filename} caption=${JSON.stringify(caption)} type=${autoKpiType || dpd3190Type || "NONE"}`);
-  const allowedCaption = !isGroup || autoKpiType || dpd3190Type || containsBotTrigger(caption) || /^\s*\/excel\b/i.test(caption);
-  if (!allowedCaption) return false;
   if (isKpDailySourceName(filename) || /kp\s*daily/i.test(caption)) return processKpDailyUpload(sock, from, msg, caption);
-  if (dpd3190Type) {
-    try {
-      await sock.sendMessage(from, { text: `📊 Marley membaca *${filename}* sebagai sumber *DPD 31–90*...` });
-      const buffer = await downloadMediaMessage(msg, "buffer", {});
-      const session = await loadSpreadsheetBuffer(buffer, filename);
-      for (const sheet of session.sheets) sheet.detected = detectDatasetColumns(sheet.columns);
-      const state = dpd3190Sessions.get(from) || {};
-      state[dpd3190Type] = session;
-      dpd3190Sessions.set(from, state);
-      const report = formatDpd3190Report(state, Boolean(state.dpd31_60 && state.dpd61_90));
-      await sock.sendMessage(from, { text: report });
-    } catch (err) {
-      console.error("DPD 31-90 upload error:", err);
-      await sock.sendMessage(from, { text: `❌ Marley gagal membaca file DPD 31–90.\n${err.message}` });
-    }
-    return true;
-  }
   try {
     await sock.sendMessage(from, { text: `📊 Marley sedang membaca *${filename}*...` });
     const buffer = await downloadMediaMessage(msg, "buffer", {});
     const session = await loadSpreadsheetBuffer(buffer, filename);
     spreadsheetSessions.set(from, session);
-    if (autoKpiType) {
-      const sheet = activeSheetFor(session);
-      const autoState = autoKpiSessions.get(from) || {};
-      autoState[autoKpiType] = session;
-      autoKpiSessions.set(from, autoState);
-      await sock.sendMessage(from, { text: formatAutoRepaymentReport(sheet, autoKpiType) });
-    } else {
-      await sock.sendMessage(from, { text: `✅ Spreadsheet berhasil dibaca.\n\n${listSpreadsheetStatus(session)}\n\nMarley siap menganalisa *file ini saja*.\nContoh: *Marley, analisa repayment*` });
-    }
+    await sock.sendMessage(from, { text: `✅ Spreadsheet berhasil dibaca.\n\n${listSpreadsheetStatus(session)}\n\nMarley siap menganalisa *file ini saja*.\nContoh: *Marley, analisa repayment*` });
   } catch (err) {
     console.error("Spreadsheet upload error:", err);
     await sock.sendMessage(from, { text: `❌ Marley gagal membaca spreadsheet.\n${err.message}` });
@@ -2177,7 +1490,7 @@ function scoreKpiDpd0(r){if(!Number.isFinite(r))return null;if(r<.90)return 0;if
 function scoreKpiDpd1_30(r){if(!Number.isFinite(r))return null;if(r<=KPI_CONFIG.dpd1_30.target)return r/KPI_CONFIG.dpd1_30.target;if(r<=.65)return 1.20;return 1.30;}
 function scoreKpiDpd31_90(r){if(!Number.isFinite(r))return null;if(r<=KPI_CONFIG.dpd31_90.target)return r/KPI_CONFIG.dpd31_90.target;if(r<=.20)return 1.20;return 1.30;}
 
-function kpiRepaymentBucket(sheet,pointFilter,minDpd,maxDpd){const d=sheet.detected;if(!d.dpdOld||!d.paymentMin1x)return null;const rows=filterRows(sheet,pointFilter);let total=0,paid=0,paymentAmount=0,os=0,arrears=0;for(const r of rows){if(d.restructured && !isNo(r[d.restructured]))continue;const dpd=toNumber(r[d.dpdOld]);if(dpd===null||dpd<minDpd||dpd>maxDpd)continue;total++;if(isYes(r[d.paymentMin1x]))paid++;if(d.payment)paymentAmount+=toNumber(r[d.payment])||0;if(d.osNew)os+=toNumber(r[d.osNew])||0;if(d.arrears)arrears+=toNumber(r[d.arrears])||0;}return{total,paid,unpaid:total-paid,repayment:total?paid/total:null,paymentAmount,os,arrears};}
+function kpiRepaymentBucket(sheet,pointFilter,minDpd,maxDpd){const d=sheet.detected;if(!d.dpdOld||!d.paymentMin1x)return null;const rows=filterRows(sheet,pointFilter);let total=0,paid=0,paymentAmount=0,os=0,arrears=0;for(const r of rows){const dpd=toNumber(r[d.dpdOld]);if(dpd===null||dpd<minDpd||dpd>maxDpd)continue;total++;if(isYes(r[d.paymentMin1x]))paid++;if(d.payment)paymentAmount+=toNumber(r[d.payment])||0;if(d.osNew)os+=toNumber(r[d.osNew])||0;if(d.arrears)arrears+=toNumber(r[d.arrears])||0;}return{total,paid,unpaid:total-paid,repayment:total?paid/total:null,paymentAmount,os,arrears};}
 
 function isKpDailySourceName(name){return /kp\s*daily|kp_daily|kpdaily/i.test(String(name||""));}
 function isApprovalStatus(value){const s=String(value??"").trim().toLowerCase();if(!s)return true;return /approve|approved|approval|disetujui|setuju|lolos|approved\s*\/\s*approve/i.test(s);}
@@ -2468,71 +1781,6 @@ function trackGroupActivity(groupId) {
 
 const BOT_NAME = "Marley";
 
-// ======================================================
-// AUTO REPLY NOMOR KHUSUS
-// ======================================================
-// Nomor disimpan dalam format internasional tanpa tanda +, spasi, atau strip.
-const SPECIAL_AUTO_REPLY_NUMBER = "6283854238002";
-const SPECIAL_AUTO_REPLY_TEXT =
-  "baik Siap komandan, akan Marley Monitor dan reminder ke teman teman BM";
-
-function normalizePhoneDigits(value) {
-  let digits = String(value || "").replace(/\D/g, "");
-  if (digits.startsWith("0")) digits = "62" + digits.slice(1);
-  if (digits.startsWith("+")) digits = digits.slice(1);
-  return digits;
-}
-
-function normalizeJid(value) {
-  return String(value || "")
-    .replace(/:[^@]+(?=@)/, "")
-    .trim();
-}
-
-function jidPhoneDigits(value) {
-  const jid = normalizeJid(value);
-  const user = jid.split("@")[0] || "";
-  return normalizePhoneDigits(user);
-}
-
-async function isSpecialAutoReplySender(sock, groupId, senderJid) {
-  const target = normalizePhoneDigits(SPECIAL_AUTO_REPLY_NUMBER);
-  if (!target || !senderJid) return false;
-
-  // Jika WhatsApp mengirim sender sebagai nomor JID, cocokkan langsung.
-  if (jidPhoneDigits(senderJid) === target) return true;
-
-  // Pada sebagian grup WhatsApp, sender bisa datang sebagai @lid.
-  // Metadata grup dipakai untuk mencari pasangan LID <-> nomor/JID.
-  if (!groupId?.endsWith("@g.us")) return false;
-
-  try {
-    const metadata = await sock.groupMetadata(groupId);
-    const participants = metadata?.participants || [];
-    const sender = normalizeJid(senderJid);
-
-    const participant = participants.find((p) => {
-      const ids = [p?.id, p?.jid, p?.lid, p?.phoneNumber, p?.phone].filter(Boolean);
-      return ids.some((id) => normalizeJid(id) === sender);
-    });
-
-    if (!participant) return false;
-
-    const candidateValues = [
-      participant?.id,
-      participant?.jid,
-      participant?.lid,
-      participant?.phoneNumber,
-      participant?.phone,
-    ];
-
-    return candidateValues.some((value) => jidPhoneDigits(value) === target);
-  } catch (err) {
-    console.warn("Gagal mencocokkan nomor auto-reply:", err?.message || err);
-    return false;
-  }
-}
-
 const triggerPattern = new RegExp(
   `(^|[\\s@.,!?;:()\\[\\]{}'"-])${BOT_NAME}(?=$|[\\s@.,!?;:()\\[\\]{}'"-])`,
   "i"
@@ -2665,36 +1913,10 @@ async function startBot() {
   sock.ev.on(
     "messages.upsert",
     async ({ messages }) => {
-      if (!Array.isArray(messages) || !messages.length) return;
-
-      // Baileys dapat mengirim beberapa pesan/file dalam satu event upsert.
-      // Proses semua spreadsheet terlebih dahulu agar file kedua/ketiga tidak terlewat.
-      let handledSpreadsheetInBatch = false;
-      for (const batchMsg of messages) {
-        if (!batchMsg?.message) continue;
-        const batchFrom = batchMsg.key.remoteJid;
-        if (!batchFrom) continue;
-        const batchText =
-          batchMsg.message.conversation ||
-          batchMsg.message.extendedTextMessage?.text ||
-          batchMsg.message.documentMessage?.caption ||
-          batchMsg.message.documentWithCaptionMessage?.message?.documentMessage?.caption ||
-          "";
-        try {
-          const handledBatchFile = await processSpreadsheetUpload(sock, batchFrom, batchMsg, batchText);
-          if (handledBatchFile) handledSpreadsheetInBatch = true;
-        } catch (batchSpreadsheetErr) {
-          console.error("Spreadsheet batch engine error:", batchSpreadsheetErr);
-        }
-      }
-
-      // Jika batch berisi file spreadsheet, semua file sudah diproses di atas.
-      // Hindari memproses file pertama untuk kedua kalinya.
-      if (handledSpreadsheetInBatch) return;
-
       const msg = messages[0];
 
       if (!msg?.message) return;
+      if (msg.key.fromMe) return;
 
       const from = msg.key.remoteJid;
       if (!from) return;
@@ -2718,38 +1940,19 @@ async function startBot() {
 
       // Spreadsheet / CSV / Google Sheets engine.
       try {
+        const document = msg.message?.documentMessage || msg.message?.documentWithCaptionMessage?.message?.documentMessage;
+        const documentName = document?.fileName || "";
+        if (document && isOpsPortfolioSourceName(documentName)) {
+          const handledOps = await processOpsReportUpload(sock, from, msg, documentName);
+          if (handledOps) return;
+        }
+
         const handledFile = await processSpreadsheetUpload(sock, from, msg, text);
         if (handledFile) return;
         const handledLink = await processSpreadsheetLink(sock, from, text);
         if (handledLink) return;
       } catch (spreadsheetErr) {
         console.error("Spreadsheet engine error:", spreadsheetErr);
-      }
-
-      // Pesan teks yang dikirim oleh akun bot sendiri tetap diabaikan agar tidak loop.
-      // File spreadsheet sudah diproses di atas sebelum pengecekan fromMe.
-      if (msg.key.fromMe) return;
-
-      // AUTO REPLY NOMOR KHUSUS: semua pesan dari nomor target di grup
-      // langsung dibalas dengan template khusus, tanpa melewati Gemini.
-      if (isGroup) {
-        const senderJid = msg.key.participant || msg.key.remoteJid;
-        const isSpecialSender =
-          await isSpecialAutoReplySender(sock, from, senderJid);
-
-        if (isSpecialSender) {
-          try {
-            await sock.sendMessage(from, {
-              text: SPECIAL_AUTO_REPLY_TEXT,
-            });
-          } catch (specialReplyErr) {
-            console.error(
-              "Gagal mengirim special auto-reply:",
-              specialReplyErr
-            );
-          }
-          return;
-        }
       }
 
       const mentionedJids =
@@ -2970,49 +2173,25 @@ async function startBot() {
         }
 
         // ==================================================
-        // PQI NATURAL LANGUAGE
-        // ==================================================
-        // Jawab langsung pertanyaan seperti:
-        // "Marley Sepulu perlu berapa repayment supaya PQI 92%?"
-        // sebelum masuk ke command/Gemini.
-        if (!isGroup || isMentioned) {
-          const pqiAnswer = answerPqiRepaymentQuestion(text, from);
-          if (pqiAnswer) {
-            await sock.sendMessage(from, { text: pqiAnswer });
-            return;
-          }
-        }
-
-        // ==================================================
         // COMMAND
         // ==================================================
 
         const command =
           text.trim().toLowerCase();
 
-        const breakdownBp = parseBreakdownBpCommand(text);
-        if (breakdownBp) {
-          await sock.sendMessage(from, { text: formatBreakdownBpReport(from, breakdownBp.bucket, breakdownBp.point) });
+        if (command === "/dbstatus" || command === "/portfoliodb") {
+          await sock.sendMessage(from, { text: portfolioDatabaseStatus() });
           return;
         }
 
-        if (/^\/wob(?:\s+point\s+(.+))?$/i.test(text.trim())) {
-          const m = text.trim().match(/^\/wob(?:\s+point\s+(.+))?$/i);
-          await sock.sendMessage(from, {
-            text: formatWobReport(from, m?.[1]?.trim() || null)
-          });
-          return;
-        }
-
-        if (/^\/pqi(?:\s+(.+))?$/i.test(text.trim())) {
-          const m = text.trim().match(/^\/pqi(?:\s+(.+))?$/i);
-          await sock.sendMessage(from, { text: formatPqiReport(from, m?.[1]?.trim() || null) });
-          return;
-        }
-
-        const loanCommand = parseLoanCommand(text);
-        if (loanCommand) {
-          await answerLoanQuery(sock, from, loanCommand);
+        if (/^\/loan\s+/i.test(command)) {
+          const query = command.replace(/^\/loan\s+/i, "").trim();
+          const found = portfolioDatabaseFind(query);
+          if (!found.length) {
+            await sock.sendMessage(from, { text: `🔎 Loan/customer *${query}* tidak ditemukan di Portfolio Database.` });
+          } else {
+            await sock.sendMessage(from, { text: `🔎 *HASIL PENCARIAN LOAN* (${found.length})\n\n${found.slice(0, 10).map(formatPortfolioLoan).join("\n\n────────────\n\n")}` });
+          }
           return;
         }
 
@@ -3175,20 +2354,9 @@ async function startBot() {
               "/analisa - analisis masalah + saran action plan\n" +
               "/proyeksi - hitung proyeksi dari data di chat\n" +
               "/data - status spreadsheet yang sedang dimuat\n" +
-              "/pqi - hitung PQI per Point Area Bangkalan (Current + DPD 1-30 + DPD 31-60)\n" +
-              "/loan <Customer Number/Nama Mitra> - cari data loan\n" +
-              "/cari <Customer Number/Nama Mitra> - cari data loan\n" +
-              "Upload file DPD 31-60 + DPD 61-90 - menjadi sumber DPD 31-90 (hanya Area Bangkalan, restruktur NO)\n" +
               "Upload file bernama KP Daily - menjadi sumber NTB/ETB (hanya Area Bangkalan)\n" +
               "/grafik - buat grafik payment per point\n" +
               "/grafik tunggakan - grafik tunggakan per point\n" +
-              "/wob - daftar WOB 6 / DPD 7+ seluruh Area Bangkalan\n" +
-              "/wob point XXX - daftar WOB 6 / DPD 7+ per Point\n" +
-              "/breakdown bp - breakdown BP Current per Point\n" +
-              "/breakdown bp kwanyar - breakdown BP Current Point Kwanyar\n" +
-              "/breakdown bp 1-30 - breakdown BP DPD 1–30 per Point\n" +
-              "/breakdown bp 31-90 - breakdown BP DPD 31–90 per Point\n" +
-              "/breakdown bp 31-90 blega - breakdown BP DPD 31–90 Point Blega\n" +
               "/statusclosing - status report closing hari ini\n" +
               "/rekapclosing - rekap closing area hari ini\n" +
               "/rekapclosing YYYY-MM-DD - rekap tanggal tertentu\n" +
@@ -3200,24 +2368,6 @@ async function startBot() {
               "Marley lupakan: ... - hapus memory\n\n" +
               'Atau sebut nama saya "Marley" diikuti pertanyaan apa saja.',
           });
-        } else if (
-          looksLikeLoanQuestion(text) &&
-          (!isGroup || isMentioned)
-        ) {
-          await answerLoanQuery(sock, from, stripMentions(text));
-          return;
-        } else if (/\bpqi\b|portfolio\s*quality/i.test(stripMentions(text)) && (!isGroup || isMentioned)) {
-          const cleanQ = stripMentions(text);
-          const pointMatch = cleanQ.match(/\b(?:point|pt)\s+(.+?)(?:\s+(?:pqi|cek|check|berapa|berapa\s+nilai).*)?$/i);
-          const requestedPoint = pointMatch ? pointMatch[1].trim().replace(/[?.!,]+$/g, "") : null;
-          await sock.sendMessage(from, { text: formatPqiReport(from, requestedPoint) });
-          return;
-        } else if (dpd3190Sessions.has(from) && (!isGroup || isMentioned) && /31\s*[-–_]?\s*90|dpd|repayment|movement|flow|stay|rollback|outstanding|os|point|ranking/i.test(stripMentions(text))) {
-          const cleanQ = stripMentions(text);
-          if (/31\s*[-–_]?\s*90|dpd\s*31|movement|flow|stay|rollback|outstanding|\bos\b|point|ranking/i.test(cleanQ)) {
-            await sock.sendMessage(from, { text: answerDpd3190Question(dpd3190Sessions.get(from), cleanQ) });
-            return;
-          }
         } else if ((spreadsheetSessions.has(from) || kpDailySessions.has(from)) && (!isGroup || isMentioned) && /kpi|repayment|ntb|etb|disbursement|spreadsheet|excel|point mana|ranking|tunggakan|data file|file ini|grafik|loan|payment|dpd/i.test(stripMentions(text))) {
           const cleanQ=stripMentions(text);
           if (/kpi|ntb|etb|disbursement/i.test(cleanQ) && kpDailySessions.has(from)) {
@@ -3341,7 +2491,7 @@ app.listen(PORT, () => {
 async function bootstrap() {
   await initMemory();
   await initDailyReports();
-  await initLoanMemory();
+  await initPortfolioDatabase();
   await startBot();
 }
 
