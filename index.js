@@ -1630,6 +1630,8 @@ function detectWob6Columns(payload) {
     customerNumber: byName(["customer_number", "customer number", "customer_no", "customer_no_id"]),
     customerName: byName(["customer_name", "customer name", "nama_mitra", "nama mitra"]),
     dpdOld: byName(["dpd_old", "dpd old", "dpd"]),
+    dpdNew: byName(["dpd_new", "dpd new", "dpdnew"]),
+    week: byName(["week", "wob_week", "week_number", "minggu"]),
     installmentPaidCount: byName([
       "total_settled_installment_fully_paid_count",
       "settled_installment_fully_paid_count",
@@ -1641,34 +1643,47 @@ function detectWob6Columns(payload) {
 }
 
 function buildWob6PointSummary(current) {
-  if (!current?.rows?.length) return { total: 0, byPoint: {}, byBp: {} };
+  const empty = { total: 0, byPoint: {}, byBp: {}, yellowTotal: 0, redTotal: 0, byPointYellow: {}, byPointRed: {}, byBpYellow: {}, byBpRed: {} };
+  if (!current?.rows?.length) return empty;
   const d = detectWob6Columns(current);
-  if (!d.point || !d.dpdOld || !d.installmentPaidCount || !d.paymentMin1x) return { total: 0, byPoint: {}, byBp: {} };
-  const byPoint = {};
-  const byBp = {};
+  if (!d.point || !d.week || !d.paymentMin1x) return empty;
+  const byPointYellow = {}, byPointRed = {}, byBpYellow = {}, byBpRed = {};
+  const seenPointYellow = new Map(), seenPointRed = new Map(), seenBpYellow = new Map(), seenBpRed = new Map();
   const area = d.area;
-  const seenPointCustomer = new Map();
-  const seenBpCustomer = new Map();
+  const makeKey = (r, point, bp) => String(r[d.customerNumber] ?? r[d.customerName] ?? r[d.loanId] ?? "").trim() || `${point}|${bp}|${JSON.stringify(r)}`;
   for (const r of current.rows) {
-    if (area && normalizeArea(r[d.area]) !== "bangkalan") continue;
+    if (area && normalizeArea(r[area]) !== "bangkalan") continue;
     if (d.restructured && !isNo(r[d.restructured])) continue;
-    const dpd = toNumber(r[d.dpdOld]);
-    const installment = toNumber(r[d.installmentPaidCount]);
-    if (dpd == null || dpd < 7 || installment == null || installment > 7) continue;
+    const week = toNumber(r[d.week]);
+    if (week !== 6) continue;
     if (isYes(r[d.paymentMin1x])) continue;
     const point = String(r[d.point] ?? "").trim();
     if (!point) continue;
     const bp = String(r[d.bp] ?? "").trim() || "—";
-    const customerKey = String(r[d.customerNumber] ?? r[d.customerName] ?? "").trim() || `${point}|${bp}|${JSON.stringify(r)}`;
-    if (!seenPointCustomer.has(point)) seenPointCustomer.set(point, new Set());
-    if (!seenBpCustomer.has(`${point}\u0000${bp}`)) seenBpCustomer.set(`${point}\u0000${bp}`, new Set());
-    seenPointCustomer.get(point).add(customerKey);
-    seenBpCustomer.get(`${point}\u0000${bp}`).add(customerKey);
+    const key = makeKey(r, point, bp);
+    const dpdNew = d.dpdNew ? toNumber(r[d.dpdNew]) : null;
+    const red = dpdNew != null && dpdNew >= 7;
+    if (!seenPointYellow.has(point)) seenPointYellow.set(point, new Set());
+    if (!seenBpYellow.has(`${point}\u0000${bp}`)) seenBpYellow.set(`${point}\u0000${bp}`, new Set());
+    seenPointYellow.get(point).add(key);
+    seenBpYellow.get(`${point}\u0000${bp}`).add(key);
+    byPointYellow[point] = seenPointYellow.get(point).size;
+    byBpYellow[`${point}\u0000${bp}`] = seenBpYellow.get(`${point}\u0000${bp}`).size;
+    if (red) {
+      if (!seenPointRed.has(point)) seenPointRed.set(point, new Set());
+      if (!seenBpRed.has(`${point}\u0000${bp}`)) seenBpRed.set(`${point}\u0000${bp}`, new Set());
+      seenPointRed.get(point).add(key);
+      seenBpRed.get(`${point}\u0000${bp}`).add(key);
+      byPointRed[point] = seenPointRed.get(point).size;
+      byBpRed[`${point}\u0000${bp}`] = seenBpRed.get(`${point}\u0000${bp}`).size;
+    }
   }
-  let total = 0;
-  for (const [point, set] of seenPointCustomer) { byPoint[point] = set.size; total += set.size; }
-  for (const [key, set] of seenBpCustomer) byBp[key] = set.size;
-  return { total, byPoint, byBp, detected: d };
+  const yellowTotal = [...seenPointYellow.values()].reduce((n,s) => n+s.size, 0);
+  const redTotal = [...seenPointRed.values()].reduce((n,s) => n+s.size, 0);
+  const byPoint = {}, byBp = {};
+  for (const p of new Set([...Object.keys(byPointYellow), ...Object.keys(byPointRed)])) byPoint[p] = (byPointYellow[p] || 0) + (byPointRed[p] || 0);
+  for (const k of new Set([...Object.keys(byBpYellow), ...Object.keys(byBpRed)])) byBp[k] = (byBpYellow[k] || 0) + (byBpRed[k] || 0);
+  return { total: yellowTotal, redTotal, yellowTotal, byPoint, byBp, byPointYellow, byPointRed, byBpYellow, byBpRed, detected: d };
 }
 
 function kpiBreakdown(payloads) {
@@ -2903,11 +2918,13 @@ app.get("/api/dashboard/mitra", async (req, res) => {
     const point = String(req.query.point || "").trim();
     const bp = String(req.query.bp || "").trim();
     const bucket = String(req.query.bucket || "").trim();
+    const wobMode = String(req.query.wob || "").trim().toLowerCase();
     const wob6 = String(req.query.wob6 || "") === "1";
-    if (!point && !bp && !bucket && !wob6) return res.json({ rows: [] });
+    const wobFilter = wobMode === "red" || wobMode === "yellow" ? wobMode : (wob6 ? "red" : "");
+    if (!point && !bp && !bucket && !wobFilter) return res.json({ rows: [] });
 
     const payloads = [];
-    const names = wob6 ? ["current"] : (bucket === "31-90" ? ["dpd31_60","dpd61_90"] : [bucket === "1-30" ? "dpd1_30" : bucket || "current"]);
+    const names = wobFilter ? ["current"] : (bucket === "31-90" ? ["dpd31_60","dpd61_90"] : [bucket === "1-30" ? "dpd1_30" : bucket || "current"]);
     for (const k of names) {
       const payload = await readKpiJson(k);
       if (payload) payloads.push(payload);
@@ -2917,12 +2934,14 @@ app.get("/api/dashboard/mitra", async (req, res) => {
     const seen = new Set();
     for (const payload of payloads) {
       const d = payload.detected || {};
-      const wd = wob6 && payload.bucket === "current" ? detectWob6Columns(payload) : null;
+      const wd = payload.bucket === "current" ? detectWob6Columns(payload) : null;
       const pointCol = wd?.point || d.point;
       const bpCol = wd?.bp || d.bp;
       const paymentCol = wd?.paymentMin1x || d.paymentMin1x;
-      const dpdCol = wd?.dpdOld || d.dpdOld;
+      const dpdOldCol = d.dpdOld;
+      const dpdNewCol = wd?.dpdNew || d.dpdNew;
       const installmentCol = wd?.installmentPaidCount || null;
+      const weekCol = wd?.week || null;
       const restructureCol = wd?.restructured || d.restructured;
       if (!pointCol) continue;
       for (const r of payload.rows || []) {
@@ -2931,19 +2950,32 @@ app.get("/api/dashboard/mitra", async (req, res) => {
         if (point && rowPoint.toLowerCase() !== point.toLowerCase()) continue;
         if (bp && rowBp.toLowerCase() !== bp.toLowerCase()) continue;
 
-        const dpd = dpdCol ? toNumber(r[dpdCol]) : null;
+        const dpd = (wobFilter && dpdNewCol) ? toNumber(r[dpdNewCol]) : (d.dpdOld ? toNumber(r[d.dpdOld]) : null);
+        const paid = paymentCol ? isYes(r[paymentCol]) : false;
+        const restructured = restructureCol && !isNo(r[restructureCol]);
         let inBucket = true;
-        if (wob6) {
-          const installment = installmentCol ? toNumber(r[installmentCol]) : null;
-          const paid = paymentCol && isYes(r[paymentCol]);
-          const restructured = restructureCol && !isNo(r[restructureCol]);
-          inBucket = dpd !== null && dpd >= 7 && installment !== null && installment <= 7 && !paid && !restructured;
+        let isWobYellow = false;
+        let isWobRed = false;
+        if (wobFilter) {
+          const week = weekCol ? toNumber(r[weekCol]) : null;
+          const dpdNew = dpdNewCol ? toNumber(r[dpdNewCol]) : null;
+          isWobYellow = week === 6 && !paid && !restructured;
+          isWobRed = isWobYellow && dpdNew != null && dpdNew >= 7;
+          inBucket = wobFilter === "red" ? isWobRed : isWobYellow;
+          if (inBucket && bucket) {
+            if (bucket === "current") inBucket = dpdNew === 0;
+            else if (bucket === "1-30") inBucket = dpdNew != null && dpdNew >= 1 && dpdNew <= 30;
+            else if (bucket === "dpd31_60") inBucket = dpdNew != null && dpdNew >= 31 && dpdNew <= 60;
+            else if (bucket === "dpd61_90") inBucket = dpdNew != null && dpdNew >= 61 && dpdNew <= 90;
+            else if (bucket === "31-90") inBucket = dpdNew != null && dpdNew >= 31 && dpdNew <= 90;
+          }
         } else if (bucket === "dpd31_60") inBucket = dpd !== null && dpd >= 31 && dpd <= 60;
         else if (bucket === "dpd61_90") inBucket = dpd !== null && dpd >= 61 && dpd <= 90;
         else if (bucket === "31-90") inBucket = dpd !== null && dpd >= 31 && dpd <= 90;
+        else if (bucket === "1-30") inBucket = dpd !== null && dpd >= 1 && dpd <= 30;
+        else if (bucket === "current") inBucket = dpd === 0;
         if (!inBucket) continue;
 
-        const paid = paymentCol ? isYes(r[paymentCol]) : false;
         const customer = d.customer ? String(r[d.customer] ?? "").trim() : "";
         const customerNumber = d.customerNumber ? String(r[d.customerNumber] ?? "").trim() : "";
         const loanId = d.loanId ? String(r[d.loanId] ?? "").trim() : "";
@@ -2952,10 +2984,11 @@ app.get("/api/dashboard/mitra", async (req, res) => {
         seen.add(key);
         const os = d.osNew ? toNumber(r[d.osNew]) || 0 : 0;
         const installment = installmentCol ? toNumber(r[installmentCol]) : null;
-        out.push({ point: rowPoint, bp: rowBp || "—", customerName: customer || "—", customerNumber: customerNumber || "—", loanId: loanId || "—", dpd: dpd == null ? null : dpd, os, paid, wob6, installmentPaidCount: installment });
+        const week = weekCol ? toNumber(r[weekCol]) : null;
+        out.push({ point: rowPoint, bp: rowBp || "—", customerName: customer || "—", customerNumber: customerNumber || "—", loanId: loanId || "—", dpd: dpd == null ? null : dpd, dpdNew: dpdNewCol ? toNumber(r[dpdNewCol]) : null, os, paid, wob6: isWobRed, wobYellow: isWobYellow, wobRed: isWobRed, week, installmentPaidCount: installment });
       }
     }
-    out.sort((a,b) => Number(b.wob6) - Number(a.wob6) || Number(a.paid) - Number(b.paid) || (b.os - a.os));
+    out.sort((a,b) => Number(b.wobRed) - Number(a.wobRed) || Number(b.wobYellow) - Number(a.wobYellow) || Number(a.paid) - Number(b.paid) || (b.os - a.os));
     res.json({ rows: out.slice(0, 1000), total: out.length, truncated: out.length > 1000 });
   } catch (err) {
     console.error("Dashboard mitra API error:", err);
