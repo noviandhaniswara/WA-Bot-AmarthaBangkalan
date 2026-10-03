@@ -5,7 +5,6 @@ import fs from "fs/promises";
 import path from "path";
 import { fileURLToPath } from "url";
 import { GoogleGenAI } from "@google/genai";
-import { createHash } from "crypto";
 import * as XLSX from "xlsx";
 import sharp from "sharp";
 import {
@@ -964,29 +963,13 @@ function portfolioRecordFromRow(row, d, sourceName, sourceDate) {
   };
 }
 
-function makePortfolioFingerprint(buffer) {
-  return createHash("sha256").update(buffer).digest("hex");
+function makePortfolioFingerprint(sourceName, rows, sourceDate) {
+  const first = rows[0] || {};
+  const last = rows[rows.length - 1] || {};
+  return [sourceName, sourceDate || "", rows.length, JSON.stringify(first), JSON.stringify(last)].join("|");
 }
 
 async function syncOpsReportToPortfolioDatabase(buffer, sourceName) {
-  const fileHash = makePortfolioFingerprint(buffer);
-  const already = loanHistory.find((x) => x.fileHash === fileHash);
-  if (already) {
-    return {
-      duplicate: true,
-      fileHash,
-      sourceName,
-      sourceDate: already.sourceDate || new Date().toISOString().slice(0, 10),
-      totalRows: already.totalRows || 0,
-      bangkalanRows: already.bangkalanRows || 0,
-      added: 0,
-      updated: 0,
-      skipped: 0,
-      totalLoans: Object.keys(loanMemory.loans).length,
-      customers: Object.keys(loanMemory.customers).length,
-    };
-  }
-
   const workbook = XLSX.read(buffer, { type: "buffer", cellDates: true, raw: true });
   const sheets = workbook.SheetNames || [];
   let totalRows = 0, bangkalanRows = 0, added = 0, updated = 0, skipped = 0;
@@ -1046,17 +1029,21 @@ async function syncOpsReportToPortfolioDatabase(buffer, sourceName) {
     }
   }
 
-  loanHistory.push({
-    syncedAt: new Date().toISOString(),
-    sourceName,
-    sourceDate,
-    totalRows,
-    bangkalanRows,
-    added,
-    updated,
-    skipped,
-    fileHash,
-  });
+  const fingerprint = makePortfolioFingerprint(sourceName, Object.values(loanMemory.loans).slice(-Math.min(bangkalanRows, 20)), sourceDate);
+  const already = loanHistory.find((x) => x.fingerprint === fingerprint);
+  if (!already) {
+    loanHistory.push({
+      syncedAt: new Date().toISOString(),
+      sourceName,
+      sourceDate,
+      totalRows,
+      bangkalanRows,
+      added,
+      updated,
+      skipped,
+      fingerprint,
+    });
+  }
 
   await savePortfolioDatabase();
   await saveLoanHistory();
@@ -1092,11 +1079,6 @@ async function processOpsReportUpload(sock, from, msg, filename) {
     await sock.sendMessage(from, { text: `🗄️ Marley menyimpan *${filename}* ke Portfolio Database...` });
     const buffer = await downloadMediaMessage(msg, "buffer", {});
     const result = await syncOpsReportToPortfolioDatabase(buffer, filename);
-    if (result.duplicate) {
-      await sock.sendMessage(from, { text: `ℹ️ *OPS REPORT SUDAH ADA*\n\nFile yang sama persis sudah pernah diproses.\nTidak ada data yang dihitung ulang.` });
-      return true;
-    }
-
     await sock.sendMessage(from, { text: `✅ *OPS REPORT TERSIMPAN*\n\nBangkalan: ${result.bangkalanRows.toLocaleString("id-ID")} baris\n➕ Baru: ${result.added.toLocaleString("id-ID")}\n🔄 Diperbarui: ${result.updated.toLocaleString("id-ID")}\n⚠️ Dilewati: ${result.skipped.toLocaleString("id-ID")}\n\nTotal loan di database: ${result.totalLoans.toLocaleString("id-ID")}\nCustomer: ${result.customers.toLocaleString("id-ID")}\n\nRecord yang tidak muncul pada report terbaru *tidak dianggap lunas*.` });
     return true;
   } catch (err) {
@@ -2462,6 +2444,154 @@ async function startBot() {
     }
   );
 }
+
+
+// ======================================================
+// MARLEY PORTFOLIO CONTROL TOWER DASHBOARD
+// ======================================================
+
+function dashboardBucketForLoan(loan) {
+  const d = Number(loan?.dpdOld);
+  if (!Number.isFinite(d) || d <= 0) return "current";
+  if (d <= 30) return "1-30";
+  if (d <= 90) return "31-90";
+  return "other";
+}
+
+function dashboardLoanEligible(loan) {
+  if (!portfolioAreaIsBangkalan(loan?.area)) return false;
+  if (String(loan?.status || "").toUpperCase() !== "ACTIVE") return false;
+  if (String(loan?.isLoanRestructured || "").trim().toUpperCase() === "YES") return false;
+  return dashboardBucketForLoan(loan) !== "other";
+}
+
+function dashboardPaid(loan) {
+  return isYes(loan?.paymentMin1x);
+}
+
+function dashboardTarget(bucket) {
+  if (bucket === "current") return 0.98;
+  if (bucket === "1-30") return 0.55;
+  if (bucket === "31-90") return 0.13;
+  return null;
+}
+
+function dashboardAggregate(loans, bucket = "all") {
+  const selected = loans.filter((x) => bucket === "all" || dashboardBucketForLoan(x) === bucket);
+  const paid = selected.filter(dashboardPaid).length;
+  const unpaid = selected.length - paid;
+  const os = selected.reduce((n, x) => n + (Number(x.osNew) || 0), 0);
+  const customers = new Set(selected.map((x) => x.customerNumber).filter(Boolean)).size;
+  const repayment = selected.length ? paid / selected.length : 0;
+  const target = dashboardTarget(bucket);
+  return {
+    loans: selected.length,
+    paid,
+    unpaid,
+    unpaidRate: selected.length ? unpaid / selected.length : 0,
+    os,
+    customers,
+    repayment,
+    target,
+  };
+}
+
+function buildPortfolioDashboard() {
+  const loans = Object.values(loanMemory.loans).filter(dashboardLoanEligible);
+  const buckets = ["current", "1-30", "31-90"];
+  const summary = { all: dashboardAggregate(loans, "all") };
+  for (const b of buckets) summary[b] = dashboardAggregate(loans, b);
+
+  const points = [];
+  const bps = [];
+  const pointNames = [...new Set(loans.map((x) => String(x.point || "-")).filter(Boolean))].sort();
+
+  for (const point of pointNames) {
+    for (const bucket of buckets) {
+      const rows = loans.filter((x) => String(x.point || "-") === point && dashboardBucketForLoan(x) === bucket);
+      if (!rows.length) continue;
+      const s = dashboardAggregate(rows, bucket);
+      const gap = s.repayment - s.target;
+      points.push({ point, bucket, ...s, gap, priority: Math.max(0, -gap) * 1000 + s.unpaid });
+      const bpNames = [...new Set(rows.map((x) => String(x.bp || "-")).filter(Boolean))].sort();
+      for (const bp of bpNames) {
+        const br = rows.filter((x) => String(x.bp || "-") === bp);
+        const bs = dashboardAggregate(br, bucket);
+        const bgap = bs.repayment - bs.target;
+        bps.push({ point, bp, bucket, ...bs, gap: bgap, priority: Math.max(0, -bgap) * 1000 + bs.unpaid });
+      }
+    }
+  }
+
+  // Point view in the UI uses the currently selected bucket. Keep one aggregate row per point for that bucket.
+  const pointAggregate = [];
+  for (const point of pointNames) {
+    const rows = loans.filter((x) => String(x.point || "-") === point);
+    const s = dashboardAggregate(rows, "all");
+    const gap = null;
+    pointAggregate.push({ point, bucket: "all", ...s, target: null, gap, priority: s.unpaid });
+  }
+  const pointByBucket = [];
+  for (const point of pointNames) {
+    for (const bucket of buckets) {
+      const rows = loans.filter((x) => String(x.point || "-") === point && dashboardBucketForLoan(x) === bucket);
+      if (!rows.length) continue;
+      const s = dashboardAggregate(rows, bucket);
+      const gap = s.repayment - s.target;
+      pointByBucket.push({ point, bucket, ...s, gap, priority: Math.max(0, -gap) * 1000 + s.unpaid });
+    }
+  }
+
+  // The front-end can select a bucket; for "all" show the aggregate point rows.
+  const combinedPoints = [...pointAggregate, ...pointByBucket];
+  const seen = new Set();
+  const uniquePoints = combinedPoints.filter((x) => {
+    const key = `${x.point}|${x.bucket || "all"}`;
+    if (seen.has(key)) return false;
+    seen.add(key); return true;
+  });
+
+  const updatedAt = loanMemory.updatedAt || null;
+  const updatedAtLabel = updatedAt ? new Date(updatedAt).toLocaleString("id-ID", { dateStyle: "medium", timeStyle: "short" }) : "belum ada";
+  return {
+    generatedAt: new Date().toISOString(),
+    updatedAt,
+    updatedAtLabel,
+    pointCount: pointNames.length,
+    bpCount: new Set(loans.map((x) => x.bp).filter(Boolean)).size,
+    summary,
+    points: uniquePoints,
+    bps,
+  };
+}
+
+function dashboardTokenAllowed(req) {
+  const expected = String(process.env.DASHBOARD_TOKEN || "").trim();
+  if (!expected) return true;
+  const provided = String(req.query.token || req.headers["x-dashboard-token"] || "").trim();
+  return provided === expected;
+}
+
+app.get("/dashboard", async (req, res) => {
+  if (!dashboardTokenAllowed(req)) return res.status(401).send("Dashboard token tidak valid.");
+  try {
+    res.send(await fs.readFile(path.join(__dirname, "public", "dashboard.html"), "utf8"));
+  } catch (err) {
+    console.error("DASHBOARD HTML ERROR:", err);
+    res.status(500).send("Dashboard belum tersedia.");
+  }
+});
+
+app.get("/api/dashboard", (req, res) => {
+  if (!dashboardTokenAllowed(req)) return res.status(401).json({ error: "Dashboard token tidak valid." });
+  try {
+    res.set("Cache-Control", "no-store");
+    res.json(buildPortfolioDashboard());
+  } catch (err) {
+    console.error("DASHBOARD API ERROR:", err);
+    res.status(500).json({ error: "Gagal membaca Portfolio Database." });
+  }
+});
 
 // ======================================================
 // WEB STATUS / QR
