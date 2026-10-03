@@ -1325,14 +1325,21 @@ function detectDpd3190FileType(filename, caption = "") {
   return null;
 }
 
-function repaymentForDpd3190Sheets(sheets) {
+function repaymentForDpd3190Sheets(sources) {
   let total = 0, paid = 0, paymentAmount = 0, os = 0, arrears = 0;
   const movement = new Map();
   const byPoint = new Map();
   let missingArea = false;
-  for (const [bucket, sheet] of Object.entries(sheets || {})) {
-    if (!sheet) continue;
-    const d = sheet.detected || {};
+
+  // Each uploaded source is a workbook session ({ sheets: [...] }).
+  // Flatten its sheets first so the engine never mistakes session metadata
+  // (sourceName/loadedAt/sheets) for a spreadsheet row set.
+  for (const [bucket, source] of Object.entries(sources || {})) {
+    if (!source) continue;
+    const sourceSheets = Array.isArray(source.sheets) ? source.sheets : [source];
+    for (const sheet of sourceSheets) {
+      if (!sheet) continue;
+      const d = sheet.detected || detectDatasetColumns(sheet.columns || []);
     if (!d.area || !d.dpdOld || !d.paymentMin1x || !d.restructured) {
       missingArea = true;
       continue;
@@ -1355,6 +1362,7 @@ function repaymentForDpd3190Sheets(sheets) {
       current.total++;
       if (paidRow) current.paid++;
       byPoint.set(point, current);
+      }
     }
   }
   return {
@@ -1372,7 +1380,7 @@ function formatDpd3190Report(state, includePoints = true) {
     return `📊 *DPD 31–90*\n\nSumber: ${ready}\n\nMarley menunggu kedua file untuk menghitung DPD 31–90.`;
   }
   const r = repaymentForDpd3190Sheets(state);
-  if (r.missingArea) return "❌ Kolom wajib (area_name, dpd_old, payment_min_1x, is_loan_restructured) tidak lengkap. Marley tidak akan menghitung data yang belum terverifikasi.";
+  if (r.missingArea) return "❌ Kolom wajib (area_name, dpd_old, payment_min_1x, is_loan_restructured) tidak lengkap pada salah satu file. Marley tidak akan menghitung data yang belum terverifikasi.";
   if (!r.total) return "❌ Data DPD 31–90 Area Bangkalan tidak ditemukan setelah filter restruktur NO.";
   const target = KPI_CONFIG.dpd31_90.target;
   const gap = Math.max(0, target - r.repayment);
@@ -1390,7 +1398,7 @@ function answerDpd3190Question(state, question) {
   if (!state?.dpd31_60 || !state?.dpd61_90) return formatDpd3190Report(state, false);
   const q = String(question || "").toLowerCase();
   const r = repaymentForDpd3190Sheets(state);
-  if (r.missingArea) return "❌ Kolom wajib (area_name, dpd_old, payment_min_1x, is_loan_restructured) tidak lengkap. Marley tidak akan menghitung data yang belum terverifikasi.";
+  if (r.missingArea) return "❌ Kolom wajib (area_name, dpd_old, payment_min_1x, is_loan_restructured) tidak lengkap pada salah satu file. Marley tidak akan menghitung data yang belum terverifikasi.";
   if (!r.total) return "❌ Data DPD 31–90 Area Bangkalan tidak ditemukan setelah filter restruktur NO.";
   if (/flow.*90|90\+|lebih.*90|to.*>90|to 90/.test(q)) {
     const x = r.movement.filter(([k]) => />?\s*90|90\s*\+|to\s*90/i.test(k)).reduce((s, [,v]) => s+v, 0);
