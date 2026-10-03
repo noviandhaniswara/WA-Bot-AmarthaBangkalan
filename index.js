@@ -1612,80 +1612,6 @@ function kpiRowsForPoint(payloads, point) {
   return out;
 }
 
-
-function detectWob6Columns(payload) {
-  const columns = payload?.columns || [];
-  const normalized = columns.map(c => normalizeHeader(c));
-  const byName = (candidates) => {
-    for (const candidate of candidates) {
-      const i = normalized.indexOf(normalizeHeader(candidate));
-      if (i >= 0) return columns[i];
-    }
-    return null;
-  };
-  return {
-    area: byName(["area_name", "area"]),
-    point: byName(["branch_name", "point", "point_name", "branch"]),
-    bp: byName(["agent_fullname", "bp", "bp_name", "agent_name"]),
-    customerNumber: byName(["customer_number", "customer number", "customer_no", "customer_no_id"]),
-    customerName: byName(["customer_name", "customer name", "nama_mitra", "nama mitra"]),
-    dpdOld: byName(["dpd_old", "dpd old", "dpd"]),
-    dpdNew: byName(["dpd_new", "dpd new", "dpdnew"]),
-    week: byName(["week", "wob_week", "week_number", "minggu"]),
-    installmentPaidCount: byName([
-      "total_settled_installment_fully_paid_count",
-      "settled_installment_fully_paid_count",
-      "total_settled_installment_paid_count"
-    ]),
-    paymentMin1x: byName(["payment_min_1x", "total_payment_min_1x"]),
-    restructured: byName(["is_loan_restructured", "loan_restructured"])
-  };
-}
-
-function buildWob6PointSummary(current) {
-  const empty = { total: 0, byPoint: {}, byBp: {}, yellowTotal: 0, redTotal: 0, byPointYellow: {}, byPointRed: {}, byBpYellow: {}, byBpRed: {} };
-  if (!current?.rows?.length) return empty;
-  const d = detectWob6Columns(current);
-  if (!d.point || !d.week || !d.paymentMin1x) return empty;
-  const byPointYellow = {}, byPointRed = {}, byBpYellow = {}, byBpRed = {};
-  const seenPointYellow = new Map(), seenPointRed = new Map(), seenBpYellow = new Map(), seenBpRed = new Map();
-  const area = d.area;
-  const makeKey = (r, point, bp) => String(r[d.customerNumber] ?? r[d.customerName] ?? r[d.loanId] ?? "").trim() || `${point}|${bp}|${JSON.stringify(r)}`;
-  for (const r of current.rows) {
-    if (area && normalizeArea(r[area]) !== "bangkalan") continue;
-    if (d.restructured && !isNo(r[d.restructured])) continue;
-    const week = toNumber(r[d.week]);
-    if (week !== 6) continue;
-    if (isYes(r[d.paymentMin1x])) continue;
-    const point = String(r[d.point] ?? "").trim();
-    if (!point) continue;
-    const bp = String(r[d.bp] ?? "").trim() || "—";
-    const key = makeKey(r, point, bp);
-    const dpdNew = d.dpdNew ? toNumber(r[d.dpdNew]) : null;
-    const red = dpdNew != null && dpdNew >= 7;
-    if (!seenPointYellow.has(point)) seenPointYellow.set(point, new Set());
-    if (!seenBpYellow.has(`${point}\u0000${bp}`)) seenBpYellow.set(`${point}\u0000${bp}`, new Set());
-    seenPointYellow.get(point).add(key);
-    seenBpYellow.get(`${point}\u0000${bp}`).add(key);
-    byPointYellow[point] = seenPointYellow.get(point).size;
-    byBpYellow[`${point}\u0000${bp}`] = seenBpYellow.get(`${point}\u0000${bp}`).size;
-    if (red) {
-      if (!seenPointRed.has(point)) seenPointRed.set(point, new Set());
-      if (!seenBpRed.has(`${point}\u0000${bp}`)) seenBpRed.set(`${point}\u0000${bp}`, new Set());
-      seenPointRed.get(point).add(key);
-      seenBpRed.get(`${point}\u0000${bp}`).add(key);
-      byPointRed[point] = seenPointRed.get(point).size;
-      byBpRed[`${point}\u0000${bp}`] = seenBpRed.get(`${point}\u0000${bp}`).size;
-    }
-  }
-  const yellowTotal = [...seenPointYellow.values()].reduce((n,s) => n+s.size, 0);
-  const redTotal = [...seenPointRed.values()].reduce((n,s) => n+s.size, 0);
-  const byPoint = {}, byBp = {};
-  for (const p of new Set([...Object.keys(byPointYellow), ...Object.keys(byPointRed)])) byPoint[p] = (byPointYellow[p] || 0) + (byPointRed[p] || 0);
-  for (const k of new Set([...Object.keys(byBpYellow), ...Object.keys(byBpRed)])) byBp[k] = (byBpYellow[k] || 0) + (byBpRed[k] || 0);
-  return { total: yellowTotal, redTotal, yellowTotal, byPoint, byBp, byPointYellow, byPointRed, byBpYellow, byBpRed, detected: d };
-}
-
 function kpiBreakdown(payloads) {
   const map=new Map();
   for (const p of payloads) if (p?.rows) {
@@ -1717,11 +1643,10 @@ async function getKpiDashboardData() {
   const payloads=[current,dpd1_30,dpd31_60,dpd61_90].filter(Boolean);
   const points=[...new Set(payloads.flatMap(p=>p.rows.map(r=>String(r[p.detected?.point]??"").trim()).filter(Boolean)))].sort();
   const breakdown=kpiBreakdown(payloads);
-  const wob6=buildWob6PointSummary(current);
   let ntb=0,etb=0,ntbCount=0,etbCount=0,bps=new Set();
   if(kpDaily?.rows){const d=kpDaily.detected||{};for(const r of kpDaily.rows){if(d.bp&&String(r[d.bp]??"").trim())bps.add(String(r[d.bp]).trim());const a=d.amount?toNumber(r[d.amount]):null;const k=classifyDisbursementKind(d.kind?r[d.kind]:"");if(d.status&&!isApprovalStatus(r[d.status]))continue;if(a===null||!k)continue;if(k==="NTB"){ntb+=a;ntbCount++;}else{etb+=a;etbCount++;}}}
   const bpCount=bps.size, ntbTarget=bpCount*100000000, etbTarget=bpCount*175000000;
-  return {updatedAt:new Date().toISOString(),sources:{current:current?.sourceName||null,dpd1_30:dpd1_30?.sourceName||null,dpd31_60:dpd31_60?.sourceName||null,dpd61_90:dpd61_90?.sourceName||null,kpDaily:kpDaily?.sourceName||null},summary:{current:buckets.current,"1-30":buckets["1-30"],"31-90":buckets["31-90"],all:{loans:(buckets.current?.total||0)+(buckets["1-30"]?.total||0)+(buckets["31-90"]?.total||0),unpaid:(buckets.current?.unpaid||0)+(buckets["1-30"]?.unpaid||0)+(buckets["31-90"]?.unpaid||0),os:(buckets.current?.os||0)+(buckets["1-30"]?.os||0)+(buckets["31-90"]?.os||0)}},targets:{current:.98,"1-30":.55,"31-90":.13},points,breakdown,wob6,disbursement:{bpCount,ntb,ntbCount,ntbTarget,etb,etbCount,etbTarget},availability:{current:!!current,"1-30":!!dpd1_30,"31-60":!!dpd31_60,"61-90":!!dpd61_90,kpDaily:!!kpDaily}};
+  return {updatedAt:new Date().toISOString(),sources:{current:current?.sourceName||null,dpd1_30:dpd1_30?.sourceName||null,dpd31_60:dpd31_60?.sourceName||null,dpd61_90:dpd61_90?.sourceName||null,kpDaily:kpDaily?.sourceName||null},summary:{current:buckets.current,"1-30":buckets["1-30"],"31-90":buckets["31-90"],all:{loans:(buckets.current?.total||0)+(buckets["1-30"]?.total||0)+(buckets["31-90"]?.total||0),unpaid:(buckets.current?.unpaid||0)+(buckets["1-30"]?.unpaid||0)+(buckets["31-90"]?.unpaid||0),os:(buckets.current?.os||0)+(buckets["1-30"]?.os||0)+(buckets["31-90"]?.os||0)}},targets:{current:.98,"1-30":.55,"31-90":.13},points,breakdown,disbursement:{bpCount,ntb,ntbCount,ntbTarget,etb,etbCount,etbTarget},availability:{current:!!current,"1-30":!!dpd1_30,"31-60":!!dpd31_60,"61-90":!!dpd61_90,kpDaily:!!kpDaily}};
 }
 
 async function processSpreadsheetUpload(sock, from, msg, caption = "") {
@@ -2903,100 +2828,21 @@ function buildPortfolioDashboardData() {
   };
 }
 
+app.use("/dashboard", express.static(path.join(__dirname, "public")));
+app.get("/dashboard", (req, res) => res.sendFile(path.join(__dirname, "public", "dashboard.html")));
+app.get("/api/dashboard", (req, res) => {
+  if (!dashboardTokenOk(req)) return res.status(401).json({ error: "Dashboard token tidak valid." });
+  res.json(buildPortfolioDashboardData());
+});
+
 // ======================================================
 // KPI PORTFOLIO CONTROL TOWER API / DASHBOARD
 // ======================================================
 app.get("/api/dashboard", async (req, res) => {
-  if (!dashboardTokenOk(req)) return res.status(401).json({ error: "Dashboard token tidak valid." });
   try { res.json(await getKpiDashboardData()); }
   catch (err) { console.error("Dashboard API error:", err); res.status(500).json({ error: err.message }); }
 });
 
-app.get("/api/dashboard/mitra", async (req, res) => {
-  if (!dashboardTokenOk(req)) return res.status(401).json({ error: "Dashboard token tidak valid." });
-  try {
-    const point = String(req.query.point || "").trim();
-    const bp = String(req.query.bp || "").trim();
-    const bucket = String(req.query.bucket || "").trim();
-    const wobMode = String(req.query.wob || "").trim().toLowerCase();
-    const wob6 = String(req.query.wob6 || "") === "1";
-    const wobFilter = wobMode === "red" || wobMode === "yellow" ? wobMode : (wob6 ? "red" : "");
-    if (!point && !bp && !bucket && !wobFilter) return res.json({ rows: [] });
-
-    const payloads = [];
-    const names = wobFilter ? ["current"] : (bucket === "31-90" ? ["dpd31_60","dpd61_90"] : [bucket === "1-30" ? "dpd1_30" : bucket || "current"]);
-    for (const k of names) {
-      const payload = await readKpiJson(k);
-      if (payload) payloads.push(payload);
-    }
-
-    const out = [];
-    const seen = new Set();
-    for (const payload of payloads) {
-      const d = payload.detected || {};
-      const wd = payload.bucket === "current" ? detectWob6Columns(payload) : null;
-      const pointCol = wd?.point || d.point;
-      const bpCol = wd?.bp || d.bp;
-      const paymentCol = wd?.paymentMin1x || d.paymentMin1x;
-      const dpdOldCol = d.dpdOld;
-      const dpdNewCol = wd?.dpdNew || d.dpdNew;
-      const installmentCol = wd?.installmentPaidCount || null;
-      const weekCol = wd?.week || null;
-      const restructureCol = wd?.restructured || d.restructured;
-      if (!pointCol) continue;
-      for (const r of payload.rows || []) {
-        const rowPoint = String(r[pointCol] ?? "").trim();
-        const rowBp = bpCol ? String(r[bpCol] ?? "").trim() : "";
-        if (point && rowPoint.toLowerCase() !== point.toLowerCase()) continue;
-        if (bp && rowBp.toLowerCase() !== bp.toLowerCase()) continue;
-
-        const dpd = (wobFilter && dpdNewCol) ? toNumber(r[dpdNewCol]) : (d.dpdOld ? toNumber(r[d.dpdOld]) : null);
-        const paid = paymentCol ? isYes(r[paymentCol]) : false;
-        const restructured = restructureCol && !isNo(r[restructureCol]);
-        let inBucket = true;
-        let isWobYellow = false;
-        let isWobRed = false;
-        if (wobFilter) {
-          const week = weekCol ? toNumber(r[weekCol]) : null;
-          const dpdNew = dpdNewCol ? toNumber(r[dpdNewCol]) : null;
-          isWobYellow = week === 6 && !paid && !restructured;
-          isWobRed = isWobYellow && dpdNew != null && dpdNew >= 7;
-          inBucket = wobFilter === "red" ? isWobRed : isWobYellow;
-          if (inBucket && bucket) {
-            if (bucket === "current") inBucket = dpdNew === 0;
-            else if (bucket === "1-30") inBucket = dpdNew != null && dpdNew >= 1 && dpdNew <= 30;
-            else if (bucket === "dpd31_60") inBucket = dpdNew != null && dpdNew >= 31 && dpdNew <= 60;
-            else if (bucket === "dpd61_90") inBucket = dpdNew != null && dpdNew >= 61 && dpdNew <= 90;
-            else if (bucket === "31-90") inBucket = dpdNew != null && dpdNew >= 31 && dpdNew <= 90;
-          }
-        } else if (bucket === "dpd31_60") inBucket = dpd !== null && dpd >= 31 && dpd <= 60;
-        else if (bucket === "dpd61_90") inBucket = dpd !== null && dpd >= 61 && dpd <= 90;
-        else if (bucket === "31-90") inBucket = dpd !== null && dpd >= 31 && dpd <= 90;
-        else if (bucket === "1-30") inBucket = dpd !== null && dpd >= 1 && dpd <= 30;
-        else if (bucket === "current") inBucket = dpd === 0;
-        if (!inBucket) continue;
-
-        const customer = d.customer ? String(r[d.customer] ?? "").trim() : "";
-        const customerNumber = d.customerNumber ? String(r[d.customerNumber] ?? "").trim() : "";
-        const loanId = d.loanId ? String(r[d.loanId] ?? "").trim() : "";
-        const key = loanId || `${customerNumber}|${customer}|${rowPoint}|${rowBp}|${dpd}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        const os = d.osNew ? toNumber(r[d.osNew]) || 0 : 0;
-        const installment = installmentCol ? toNumber(r[installmentCol]) : null;
-        const week = weekCol ? toNumber(r[weekCol]) : null;
-        out.push({ point: rowPoint, bp: rowBp || "—", customerName: customer || "—", customerNumber: customerNumber || "—", loanId: loanId || "—", dpd: dpd == null ? null : dpd, dpdNew: dpdNewCol ? toNumber(r[dpdNewCol]) : null, os, paid, wob6: isWobRed, wobYellow: isWobYellow, wobRed: isWobRed, week, installmentPaidCount: installment });
-      }
-    }
-    out.sort((a,b) => Number(b.wobRed) - Number(a.wobRed) || Number(b.wobYellow) - Number(a.wobYellow) || Number(a.paid) - Number(b.paid) || (b.os - a.os));
-    res.json({ rows: out.slice(0, 1000), total: out.length, truncated: out.length > 1000 });
-  } catch (err) {
-    console.error("Dashboard mitra API error:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.use("/dashboard", express.static(path.join(__dirname, "public")));
 app.get("/dashboard", async (req, res) => {
   try {
     const html = await fs.readFile(path.join(__dirname, "public", "dashboard.html"), "utf8");
@@ -3049,11 +2895,101 @@ app.listen(PORT, () => {
   console.log(`Server jalan di port ${PORT}`);
 });
 
+
+// ======================================================
+// DASHBOARD V7 — PERSONAL FILTER + LIVE CONTROL + DRILLDOWN
+// No login for now. Live Control is shared to all viewers.
+// ======================================================
+const DASH_LIVE_FILE = path.join(process.env.KPI_DATA_DIR || path.join(__dirname, "data"), "dashboard_live_control.json");
+let dashboardLiveState = { mode: "personal", point: "", bucket: "all", wob: "all", updatedAt: new Date().toISOString() };
+let dashboardLiveWriteQueue = Promise.resolve();
+
+async function initDashboardLiveState() {
+  try {
+    await fs.mkdir(path.dirname(DASH_LIVE_FILE), { recursive: true });
+    try {
+      const raw = await fs.readFile(DASH_LIVE_FILE, "utf8");
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === "object") dashboardLiveState = { ...dashboardLiveState, ...parsed };
+    } catch {}
+  } catch (err) { console.error("Dashboard live state init error:", err); }
+}
+function saveDashboardLiveState() {
+  dashboardLiveWriteQueue = dashboardLiveWriteQueue.catch(()=>{}).then(()=>fs.writeFile(DASH_LIVE_FILE, JSON.stringify(dashboardLiveState,null,2), "utf8"));
+  return dashboardLiveWriteQueue;
+}
+function dashWeekColumn(columns) { return findColumn(columns, ["week", "wob", "week_of_business", "wob_week", "week_number"]); }
+function dashInstallmentCountColumn(columns) { return findColumn(columns, ["total_settled_installment_fully_paid_count", "settled_installment_fully_paid_count", "total_settled_installment_paid_count"]); }
+function dashRepaymentRows(payload) {
+  if (!payload?.rows) return [];
+  const d = payload.detected || {};
+  return payload.rows.map(r => ({
+    raw:r, point:String(r[d.point]??"").trim(), bp:String(r[d.bp]??"").trim(), customer:String(r[d.customer]??"").trim(),
+    customerNumber:String(r[d.customerNumber]??"").trim(), loanId:String(r[d.loanId]??"").trim(),
+    dpdOld:d.dpdOld?toNumber(r[d.dpdOld]):null, dpdNew:d.dpdNew?toNumber(r[d.dpdNew]):null,
+    os:d.osNew?toNumber(r[d.osNew]):0, arrears:d.arrears?toNumber(r[d.arrears]):0,
+    paid:d.paymentMin1x?isYes(r[d.paymentMin1x]):false,
+    restructured:d.restructured?String(r[d.restructured]??"").trim():"NO",
+    week:dashWeekColumn(payload.columns||[]),
+  })).map(x=>{ x.weekValue=x.week?String(x.raw[x.week]??"").trim():""; return x; });
+}
+function dashPqi(rows) {
+  const eligible=rows.filter(x=>String(x.restructured).toLowerCase()==="no");
+  const cur=eligible.filter(x=>x.dpdOld!==null&&x.dpdOld<=0), d1=eligible.filter(x=>x.dpdOld!==null&&x.dpdOld>=1&&x.dpdOld<=30), d31=eligible.filter(x=>x.dpdOld!==null&&x.dpdOld>=31&&x.dpdOld<=60);
+  const all=cur.concat(d1,d31);
+  const rate=(a)=>a.length?a.filter(x=>x.paid).length/a.length:null;
+  const r0=rate(cur), rAll=rate(all);
+  const pqi=(r0===null||rAll===null)?null:0.5*r0+0.5*rAll;
+  return {pqi,target:.92,gap:pqi===null?null:pqi-.92,current:{total:cur.length,paid:cur.filter(x=>x.paid).length,repayment:r0},combined:{total:all.length,paid:all.filter(x=>x.paid).length,repayment:rAll}};
+}
+function dashWob(rows) {
+  return rows.filter(x=>String(x.restructured).toLowerCase()==="no" && /^6(?:\.0)?$/.test(x.weekValue) && !x.paid).map(x=>({...x, wob6:true, wobRed:x.dpdNew!==null&&x.dpdNew>=7, status:x.dpdNew!==null&&x.dpdNew>=7?"RED":"YELLOW"}));
+}
+function dashAggregate(rows,target) {
+  const eligible=rows.filter(x=>String(x.restructured).toLowerCase()==="no");
+  const paid=eligible.filter(x=>x.paid).length, total=eligible.length;
+  return {total,paid,unpaid:total-paid,repayment:total?paid/total:null,target,gap:total?paid/total-target:null,os:eligible.reduce((s,x)=>s+(Number(x.os)||0),0)};
+}
+async function getDashboardV7Data() {
+  const [current,d1,d31,d61,kp]=await Promise.all([readKpiJson("current"),readKpiJson("dpd1_30"),readKpiJson("dpd31_60"),readKpiJson("dpd61_90"),readKpiJson("kpDaily")]);
+  const c=dashRepaymentRows(current), a=dashRepaymentRows(d1), b=dashRepaymentRows(d31), d=dashRepaymentRows(d61);
+  const rows=[...c,...a,...b,...d];
+  const pointSet=new Set(rows.map(x=>x.point).filter(Boolean));
+  const bpSet=new Set(rows.map(x=>x.bp).filter(Boolean));
+  const buckets={current:c,"1-30":a,"31-90":[...b,...d]};
+  const pqiRows=[...c,...a,...b,...d];
+  const points=[...pointSet].sort();
+  const pointCards=points.map(point=>{
+    const pr=pqiRows.filter(x=>x.point===point);
+    return {point, current:dashAggregate(pr.filter(x=>x.dpdOld!==null&&x.dpdOld<=0),.98), d1_30:dashAggregate(pr.filter(x=>x.dpdOld!==null&&x.dpdOld>=1&&x.dpdOld<=30),.55), d31_90:dashAggregate(pr.filter(x=>x.dpdOld!==null&&x.dpdOld>=31&&x.dpdOld<=90),.13), pqi:dashPqi(pr), wob:dashWob(pr).length};
+  });
+  const bps=[];
+  for(const point of points){
+    const names=[...new Set(pqiRows.filter(x=>x.point===point).map(x=>x.bp).filter(Boolean))].sort();
+    for(const bp of names){
+      const br=pqiRows.filter(x=>x.point===point&&x.bp===bp);
+      const bc=br.filter(x=>x.dpdOld!==null&&x.dpdOld<=0), b1=br.filter(x=>x.dpdOld!==null&&x.dpdOld>=1&&x.dpdOld<=30), b3=br.filter(x=>x.dpdOld!==null&&x.dpdOld>=31&&x.dpdOld<=90);
+      bps.push({point,bp,current:dashAggregate(bc,.98),d1_30:dashAggregate(b1,.55),d31_90:dashAggregate(b3,.13),pqi:dashPqi(br),wob:dashWob(br).length});
+    }
+  }
+  const allSummary={current:dashAggregate(c,.98),d1_30:dashAggregate(a,.55),d31_90:dashAggregate([...b,...d],.13)};
+  const wob= dashWob(c);
+  const priority=bps.map(x=>{const gaps=[x.current.gap,x.d1_30.gap,x.d31_90.gap].filter(v=>typeof v==='number');const worst=gaps.length?Math.min(...gaps):0;const unpaid=x.current.unpaid+x.d1_30.unpaid+x.d31_90.unpaid;return {...x,priority:Math.max(0,-worst)*100+unpaid};}).sort((x,y)=>y.priority-x.priority).slice(0,20);
+  let ntb=0,etb=0,bpCount=0;
+  if(kp?.rows){const kd=kp.detected||{};bpCount=kd.bp?new Set(kp.rows.map(r=>String(r[kd.bp]??"").trim()).filter(Boolean)).size:0;for(const r of kp.rows){if(kd.status&&!isApprovalStatus(r[kd.status]))continue;const amt=kd.amount?toNumber(r[kd.amount]):null;const kind=classifyDisbursementKind(kd.kind?r[kd.kind]:"");if(amt==null||!kind)continue;if(kind==='NTB')ntb+=amt;else etb+=amt;}}
+  return {updatedAt:new Date().toISOString(),live:{...dashboardLiveState},sources:{current:current?.sourceName||null,dpd1_30:d1?.sourceName||null,dpd31_60:d31?.sourceName||null,dpd61_90:d61?.sourceName||null,kpDaily:kp?.sourceName||null},points,summary:allSummary,pqi:dashPqi(pqiRows),pointCards,bps,priority,wob:{count:wob.length,rows:wob},disbursement:{bpCount,ntb,etb,ntbTarget:bpCount*100000000,etbTarget:bpCount*175000000}};
+}
+app.get("/api/dashboard/v7", async (req,res)=>{try{res.json(await getDashboardV7Data());}catch(err){console.error("Dashboard V7 API error:",err);res.status(500).json({error:err.message});}});
+app.get("/api/dashboard/v7/live", async (req,res)=>{res.json({ok:true,live:dashboardLiveState});});
+app.post("/api/dashboard/v7/live", async (req,res)=>{try{const body=req.body||{};dashboardLiveState={...dashboardLiveState,mode:body.mode==='live'?'live':'personal',point:String(body.point||''),bucket:String(body.bucket||'all'),wob:String(body.wob||'all'),updatedAt:new Date().toISOString()};await saveDashboardLiveState();res.json({ok:true,live:dashboardLiveState});}catch(err){res.status(500).json({error:err.message});}});
+app.get("/api/dashboard/v7/loans", async (req,res)=>{try{const data=await getDashboardV7Data();let list=data.wob.rows;const point=String(req.query.point||'').trim().toLowerCase(),bp=String(req.query.bp||'').trim().toLowerCase(),bucket=String(req.query.bucket||'').trim();if(point)list=list.filter(x=>x.point.toLowerCase()===point);if(bp)list=list.filter(x=>x.bp.toLowerCase()===bp);if(bucket)list=list.filter(x=>bucket==='current'?x.dpdOld<=0:bucket==='1-30'?x.dpdOld>=1&&x.dpdOld<=30:x.dpdOld>=31&&x.dpdOld<=90);res.json({count:list.length,rows:list});}catch(err){res.status(500).json({error:err.message});}});
+
 async function bootstrap() {
   await initMemory();
   await initDailyReports();
   await initPortfolioDatabase();
   await initKpiDatabase();
+  await initDashboardLiveState();
   await startBot();
 }
 
