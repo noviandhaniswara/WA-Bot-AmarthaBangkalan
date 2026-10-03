@@ -996,51 +996,129 @@ function formatReportStatus(date) {
 }
 
 
+
+function normalizePqiText(v) {
+  return String(v ?? "").toLowerCase().trim().replace(/[^\p{L}\p{N}]+/gu, "");
+}
+
 function parsePqiPointFromQuestion(text) {
-  const m = String(text || "").match(/\b(?:pqi|repayment|paid)[\s,:-]+(?:point\s+)?([A-Za-zÀ-ÿ0-9 .'-]+?)(?=\s+(?:kurang|butuh|untuk|menuju|ke)\b|[?!.]|$)/i);
-  return m ? m[1].trim() : "";
+  const q = String(text || "").trim();
+  // Examples:
+  // "Marley Sepulu perlu berapa repayment supaya PQI 92%"
+  // "Marley, Sepulu kurang berapa repayment untuk PQI 92%?"
+  const m = q.match(/(?:marley[\s,;:-]*)?(.*?)\s+(?:perlu|kurang|butuh|butuhkan)\s+berapa\s+(?:repayment|paid|payment)/i);
+  if (m && m[1]) {
+    const raw = m[1].replace(/\b(?:untuk|supaya|agar)\s*$/i, "").trim();
+    return raw.replace(/^pqi\s*/i, "").trim();
+  }
+  const m2 = q.match(/\b(?:point\s+)?([A-Za-zÀ-ÿ0-9 .'-]+?)\s+(?:kurang|perlu|butuh)\b/i);
+  return m2 ? m2[1].trim() : "";
 }
 
 function calculateAdditionalPaidForPqi(p) {
-  const tc = Number(p.totalCurrent || 0), pc = Number(p.paidCurrent || 0);
-  const t1 = Number(p.total1_30 || 0), p1 = Number(p.paid1_30 || 0);
-  const t31 = Number(p.total31_60 || 0), p31 = Number(p.paid31_60 || 0);
-  const totalA = tc;
-  const totalB = tc + t1 + t31;
-  if (totalA <= 0 || totalB <= 0) return null;
+  const tc = Number(p.current?.total || 0);
+  const pc = Number(p.current?.paid || 0);
+  const t1 = Number(p.d130?.total || 0);
+  const p1 = Number(p.d130?.paid || 0);
+  const t31 = Number(p.d3160?.total || 0);
+  const p31 = Number(p.d3160?.paid || 0);
+  const totalAll = tc + t1 + t31;
+  if (tc <= 0 || totalAll <= 0) return null;
 
   const target = 0.92;
-  const current = 0.5 * (pc / totalA) + 0.5 * ((pc+p1+p31) / totalB);
-  if (current >= target) return { current, needed: 0 };
+  const currentPqi = 0.5 * (pc / tc) + 0.5 * ((pc + p1 + p31) / totalAll);
+  if (currentPqi >= target) {
+    return { currentPqi, needed: 0, addCurrent: 0, add130: 0, add3160: 0 };
+  }
 
-  // Each additional paid Current contributes to both numerators.
-  const a = 0.5 / totalA + 0.5 / totalB;
-  const needed = Math.max(0, Math.ceil((target-current) / a));
-  return { current, needed };
+  // One additional paid Current improves both PQI components.
+  const gainCurrent = 0.5 / tc + 0.5 / totalAll;
+  // One additional paid DPD 1–30 or 31–60 improves only component 2.
+  const gainOther = 0.5 / totalAll;
+
+  let remaining = target - currentPqi;
+  const unpaidCurrent = Math.max(0, tc - pc);
+  const unpaid130 = Math.max(0, t1 - p1);
+  const unpaid3160 = Math.max(0, t31 - p31);
+
+  const addCurrent = Math.min(unpaidCurrent, Math.max(0, Math.ceil(remaining / gainCurrent - 1e-12)));
+  remaining -= addCurrent * gainCurrent;
+
+  let add130 = 0;
+  let add3160 = 0;
+  if (remaining > 1e-12) {
+    const otherNeeded = Math.max(0, Math.ceil(remaining / gainOther - 1e-12));
+    add130 = Math.min(unpaid130, otherNeeded);
+    remaining -= add130 * gainOther;
+    if (remaining > 1e-12) {
+      const stillNeeded = Math.max(0, Math.ceil(remaining / gainOther - 1e-12));
+      add3160 = Math.min(unpaid3160, stillNeeded);
+      remaining -= add3160 * gainOther;
+    }
+  }
+
+  const needed = addCurrent + add130 + add3160;
+  const possible = remaining <= 1e-10;
+  return { currentPqi, needed: possible ? needed : null, addCurrent, add130, add3160, possible };
 }
 
-function answerPqiRepaymentQuestion(question, pqiRows) {
+function answerPqiRepaymentQuestion(question, from) {
   const q = String(question || "");
-  if (!/pqi/i.test(q) || !/(kurang|butuh|repayment|paid|mencapai|menuju).*(92|0[.,]92)|(?:92|0[.,]92).*(kurang|butuh|repayment|paid)/i.test(q)) return null;
+  if (!/pqi/i.test(q)) return null;
+  if (!/(?:kurang|perlu|butuh|butuhkan|repayment|paid|payment).*(?:92|0[.,]92)|(?:92|0[.,]92).*(?:kurang|perlu|butuh|repayment|paid|payment)/i.test(q)) return null;
+
+  const built = buildPqiPoints(from);
+  if (!built.ready) {
+    return `📊 *KEBUTUHAN REPAYMENT PQI 92%*\n\nMarley belum bisa menghitung. Data yang diperlukan: *Current + DPD 1–30 + DPD 31–60*.\n\nBelum tersedia: ${built.missing.join(" | ")}`;
+  }
 
   const requestedPoint = parsePqiPointFromQuestion(q);
-  const rows = (pqiRows || []).filter(r => r && r.point);
-  const targets = requestedPoint
-    ? rows.filter(r => normalizeForSearch(r.point).includes(normalizeForSearch(requestedPoint)))
-    : rows;
+  let rows = built.results || [];
+  if (requestedPoint) {
+    const key = normalizePqiText(requestedPoint);
+    rows = rows.filter(r => normalizePqiText(r.point) === key || normalizePqiText(r.point).includes(key));
+  }
 
-  if (!targets.length) return `🔎 Point ${requestedPoint || "yang diminta"} tidak ditemukan dalam data PQI Area Bangkalan.`;
+  if (!rows.length) {
+    return `❌ Point *${requestedPoint || "-"}* tidak ditemukan pada data PQI Area Bangkalan.`;
+  }
 
-  const lines = ["🎯 KEBUTUHAN REPAYMENT MENUJU PQI 92%", ""];
-  for (const r of targets) {
+  const lines = ["🎯 *KEBUTUHAN REPAYMENT PQI 92%*", ""];
+  for (const r of rows) {
     const calc = calculateAdditionalPaidForPqi(r);
     if (!calc) continue;
-    const pct = (calc.current * 100).toFixed(2).replace(".", ",");
+    const pct = formatPct(calc.currentPqi);
+
     if (calc.needed === 0) {
-      lines.push(`🟢 ${r.point}`, `PQI sekarang : ${pct}%`, `Status       : Aspiration`, `Kebutuhan    : 0 repayment`, "");
-    } else {
-      lines.push(`🔴 ${r.point}`, `PQI sekarang : ${pct}%`, `Target       : 92,00%`, `Kurang       : ${calc.needed} repayment`, "");
+      lines.push(
+        `🟢 *${r.point}* — PQI ${pct}`,
+        `Sudah mencapai target 92%.`,
+        ""
+      );
+      continue;
     }
+
+    if (calc.needed === null) {
+      lines.push(
+        `🔴 *${r.point}* — PQI ${pct}`,
+        `Belum mencapai 92% dan jumlah loan unpaid pada bucket yang tersedia tidak cukup untuk menutup gap.`,
+        ""
+      );
+      continue;
+    }
+
+    const detail = [];
+    if (calc.addCurrent) detail.push(`Current ${calc.addCurrent}`);
+    if (calc.add130) detail.push(`DPD 1–30 ${calc.add130}`);
+    if (calc.add3160) detail.push(`DPD 31–60 ${calc.add3160}`);
+
+    lines.push(
+      `🔴 *${r.point}* — PQI ${pct}`,
+      `Target        : 92,00%`,
+      `Kurang        : *${calc.needed} repayment*`,
+      `Komposisi min. : ${detail.join(" + ")}`,
+      ""
+    );
   }
   return lines.join("\n").trim();
 }
@@ -2582,6 +2660,20 @@ async function startBot() {
           });
 
           return;
+        }
+
+        // ==================================================
+        // PQI NATURAL LANGUAGE
+        // ==================================================
+        // Jawab langsung pertanyaan seperti:
+        // "Marley Sepulu perlu berapa repayment supaya PQI 92%?"
+        // sebelum masuk ke command/Gemini.
+        if (!isGroup || isMentioned) {
+          const pqiAnswer = answerPqiRepaymentQuestion(text, from);
+          if (pqiAnswer) {
+            await sock.sendMessage(from, { text: pqiAnswer });
+            return;
+          }
         }
 
         // ==================================================
