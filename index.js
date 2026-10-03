@@ -1333,13 +1333,13 @@ function repaymentForDpd3190Sheets(sheets) {
   for (const [bucket, sheet] of Object.entries(sheets || {})) {
     if (!sheet) continue;
     const d = sheet.detected || {};
-    if (!d.area || !d.dpdOld || !d.paymentMin1x) {
+    if (!d.area || !d.dpdOld || !d.paymentMin1x || !d.restructured) {
       missingArea = true;
       continue;
     }
     for (const r of sheet.rows || []) {
       if (normalizeArea(r[d.area]) !== "bangkalan") continue;
-      if (d.restructured && !isNo(r[d.restructured])) continue;
+      if (!isNo(r[d.restructured])) continue;
       const dpd = toNumber(r[d.dpdOld]);
       if (dpd === null || dpd < 31 || dpd > 90) continue;
       const point = d.point ? String(r[d.point] ?? "").trim() : "-";
@@ -1372,6 +1372,7 @@ function formatDpd3190Report(state, includePoints = true) {
     return `📊 *DPD 31–90*\n\nSumber: ${ready}\n\nMarley menunggu kedua file untuk menghitung DPD 31–90.`;
   }
   const r = repaymentForDpd3190Sheets(state);
+  if (r.missingArea) return "❌ Kolom wajib (area_name, dpd_old, payment_min_1x, is_loan_restructured) tidak lengkap. Marley tidak akan menghitung data yang belum terverifikasi.";
   if (!r.total) return "❌ Data DPD 31–90 Area Bangkalan tidak ditemukan setelah filter restruktur NO.";
   const target = KPI_CONFIG.dpd31_90.target;
   const gap = Math.max(0, target - r.repayment);
@@ -1389,6 +1390,7 @@ function answerDpd3190Question(state, question) {
   if (!state?.dpd31_60 || !state?.dpd61_90) return formatDpd3190Report(state, false);
   const q = String(question || "").toLowerCase();
   const r = repaymentForDpd3190Sheets(state);
+  if (r.missingArea) return "❌ Kolom wajib (area_name, dpd_old, payment_min_1x, is_loan_restructured) tidak lengkap. Marley tidak akan menghitung data yang belum terverifikasi.";
   if (!r.total) return "❌ Data DPD 31–90 Area Bangkalan tidak ditemukan setelah filter restruktur NO.";
   if (/flow.*90|90\+|lebih.*90|to.*>90|to 90/.test(q)) {
     const x = r.movement.filter(([k]) => />?\s*90|90\s*\+|to\s*90/i.test(k)).reduce((s, [,v]) => s+v, 0);
@@ -1483,7 +1485,7 @@ async function processSpreadsheetUpload(sock, from, msg, caption = "") {
       await sock.sendMessage(from, { text: `📊 Marley membaca *${filename}* sebagai sumber *DPD 31–90*...` });
       const buffer = await downloadMediaMessage(msg, "buffer", {});
       const session = await loadSpreadsheetBuffer(buffer, filename);
-      for (const sheet of session.sheets) sheet.detected = detectSpreadsheetColumns(sheet.columns);
+      for (const sheet of session.sheets) sheet.detected = detectDatasetColumns(sheet.columns);
       const state = dpd3190Sessions.get(from) || {};
       state[dpd3190Type] = session;
       dpd3190Sessions.set(from, state);
