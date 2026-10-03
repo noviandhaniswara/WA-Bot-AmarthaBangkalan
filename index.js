@@ -2924,7 +2924,29 @@ function dashWeekColumn(columns) { return findColumn(columns, ["week", "wob", "w
 function dashInstallmentCountColumn(columns) { return findColumn(columns, ["total_settled_installment_fully_paid_count", "settled_installment_fully_paid_count", "total_settled_installment_paid_count"]); }
 function dashRepaymentRows(payload) {
   if (!payload?.rows) return [];
-  const d = payload.detected || {};
+
+  // Redetect from the actual stored column list as a safety net. Older KPI JSONs
+  // may have been saved before the detail-column mapping was added.
+  const columns = payload.columns || [];
+  const stored = payload.detected || {};
+  const pick = (storedName, candidates) => storedName || findColumn(columns, candidates);
+  const d = {
+    point: pick(stored.point, ["branch_name", "point", "point_name", "branch"]),
+    bp: pick(stored.bp, ["agent_fullname", "bp_username", "bp_name", "agent_name", "bp"]),
+    customer: pick(stored.customer, ["customer_name", "customer", "mitra_name"]),
+    customerNumber: pick(stored.customerNumber, ["customer_number", "customer_no", "customer_number_id"]),
+    loanId: pick(stored.loanId, ["loan_id", "loanid", "id_loan"]),
+    dpdOld: pick(stored.dpdOld, ["dpd_old"]),
+    dpdNew: pick(stored.dpdNew, ["dpd_new"]),
+    osNew: pick(stored.osNew, ["os_new"]),
+    paymentMin1x: pick(stored.paymentMin1x, ["payment_min_1x", "total_payment_min_1x"]),
+    arrears: pick(stored.arrears, ["total_tunggakan", "arrears", "tunggakan"]),
+    installmentAmount: pick(stored.installmentAmount, ["installment_amount", "angsuran_mingguan"]),
+    installmentCount: pick(stored.installmentCount, ["total_settled_installment_fully_paid_count", "settled_installment_fully_paid_count", "total_settled_installment_paid_count"]),
+    restructured: pick(stored.restructured, ["is_loan_restructured"]),
+  };
+  const week = dashWeekColumn(columns);
+
   return payload.rows.map(r => ({
     raw:r, point:String(r[d.point]??"").trim(), bp:String(r[d.bp]??"").trim(), customer:String(r[d.customer]??"").trim(),
     customerNumber:String(r[d.customerNumber]??"").trim(), loanId:String(r[d.loanId]??"").trim(),
@@ -2933,7 +2955,7 @@ function dashRepaymentRows(payload) {
     installmentAmount:d.installmentAmount?toNumber(r[d.installmentAmount]):null, installmentCount:d.installmentCount?toNumber(r[d.installmentCount]):null,
     paid:d.paymentMin1x?isYes(r[d.paymentMin1x]):false,
     restructured:d.restructured?String(r[d.restructured]??"").trim():"NO",
-    week:dashWeekColumn(payload.columns||[]),
+    week,
   })).map(x=>{ x.weekValue=x.week?String(x.raw[x.week]??"").trim():""; return x; });
 }
 function dashPqi(rows) {
