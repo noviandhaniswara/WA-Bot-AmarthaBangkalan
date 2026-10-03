@@ -997,6 +997,124 @@ function formatReportStatus(date) {
 
 
 
+
+// ======================================================
+// WOB 6 / DPD 7+
+// "WOB 6" dipakai sebagai sebutan operasional untuk
+// mitra dengan installment fully paid count <= 7 dan
+// payment_min_1x belum bayar.
+// Sumber: file Current yang sedang aktif.
+// Output: kolom K (Majelis) + kolom S (Nama Mitra), per Point.
+// ======================================================
+
+function detectWobColumns(sheet) {
+  const columns = sheet?.columns || [];
+  const normalized = columns.map(c => normalizeHeader(c));
+  const byName = (candidates) => {
+    for (const candidate of candidates) {
+      const i = normalized.indexOf(normalizeHeader(candidate));
+      if (i >= 0) return columns[i];
+    }
+    return null;
+  };
+
+  // User specifically requested physical Excel columns K and S.
+  // If headers are available, K/S are still used as the primary source.
+  const colK = columns[10] || null; // Excel K
+  const colS = columns[18] || null; // Excel S
+
+  return {
+    area: byName(["area_name", "area"]),
+    point: byName(["branch_name", "point", "point_name", "branch"]),
+    installmentPaidCount: byName([
+      "total_settled_installment_fully_paid_count",
+      "settled_installment_fully_paid_count",
+      "total_settled_installment_paid_count"
+    ]),
+    paymentMin1x: byName(["payment_min_1x", "total_payment_min_1x"]),
+    majelis: colK,
+    customer: colS,
+  };
+}
+
+function formatWobReport(from, requestedPoint = null) {
+  const autoState = autoKpiSessions.get(from) || {};
+  const currentSheet = firstSheetFromSession(autoState.current);
+
+  if (!currentSheet) {
+    return "❌ Data *Current* belum tersedia. Upload file Current terlebih dahulu.";
+  }
+
+  const d = detectWobColumns(currentSheet);
+  if (!d.area || !d.point || !d.installmentPaidCount || !d.paymentMin1x || !d.majelis || !d.customer) {
+    return (
+      "❌ Struktur file Current belum sesuai untuk WOB.\n\n" +
+      "Marley membutuhkan: area, point, total_settled_installment_fully_paid_count, " +
+      "payment_min_1x, kolom K (Majelis), dan kolom S (Nama Mitra)."
+    );
+  }
+
+  const targetPoint = requestedPoint ? String(requestedPoint).trim() : null;
+  const targetKey = targetPoint ? normalizePqiText(targetPoint) : null;
+
+  const grouped = new Map();
+
+  for (const row of currentSheet.rows || []) {
+    if (normalizeArea(row[d.area]) !== "bangkalan") continue;
+
+    const point = String(row[d.point] ?? "").trim();
+    if (!point) continue;
+
+    if (targetKey && normalizePqiText(point) !== targetKey) continue;
+
+    const paidCount = toNumber(row[d.installmentPaidCount]);
+    if (paidCount === null || paidCount > 7) continue;
+
+    // "belum bayar" = payment_min_1x bukan Yes.
+    if (isYes(row[d.paymentMin1x])) continue;
+
+    const majelis = String(row[d.majelis] ?? "").trim();
+    const customer = String(row[d.customer] ?? "").trim();
+    if (!majelis || !customer) continue;
+
+    if (!grouped.has(point)) grouped.set(point, []);
+    grouped.get(point).push({ majelis, customer });
+  }
+
+  if (!grouped.size) {
+    return targetPoint
+      ? `✅ *WOB 6 / DPD 7+ — ${targetPoint}*\n\nTidak ditemukan mitra dengan angsuran ≤7 yang belum bayar.`
+      : "✅ *WOB 6 / DPD 7+ — AREA BANGKALAN*\n\nTidak ditemukan mitra dengan angsuran ≤7 yang belum bayar.";
+  }
+
+  const points = [...grouped.keys()].sort((a,b) => a.localeCompare(b, "id"));
+  let total = 0;
+  const lines = [
+    targetPoint
+      ? `📋 *WOB 6 / DPD 7+ — ${points[0]}*`
+      : "📋 *WOB 6 / DPD 7+ — AREA BANGKALAN*",
+    ""
+  ];
+
+  for (const point of points) {
+    const members = grouped.get(point)
+      .sort((a,b) => a.majelis.localeCompare(b.majelis, "id") || a.customer.localeCompare(b.customer, "id"));
+
+    total += members.length;
+
+    if (!targetPoint) lines.push(`*${point}*`);
+    lines.push("| Majelis | Nama Mitra |");
+    lines.push("|---|---|");
+    for (const x of members) {
+      lines.push(`| ${x.majelis.replace(/\|/g, "/")} | ${x.customer.replace(/\|/g, "/")} |`);
+    }
+    lines.push("");
+  }
+
+  lines.push(`*Total WOB 6 / DPD 7+ : ${total} mitra*`);
+  return lines.join("\n").trim();
+}
+
 function normalizePqiText(v) {
   return String(v ?? "").toLowerCase().trim().replace(/[^\p{L}\p{N}]+/gu, "");
 }
@@ -2683,6 +2801,14 @@ async function startBot() {
         const command =
           text.trim().toLowerCase();
 
+        if (/^\/wob(?:\s+point\s+(.+))?$/i.test(text.trim())) {
+          const m = text.trim().match(/^\/wob(?:\s+point\s+(.+))?$/i);
+          await sock.sendMessage(from, {
+            text: formatWobReport(from, m?.[1]?.trim() || null)
+          });
+          return;
+        }
+
         if (/^\/pqi(?:\s+(.+))?$/i.test(text.trim())) {
           const m = text.trim().match(/^\/pqi(?:\s+(.+))?$/i);
           await sock.sendMessage(from, { text: formatPqiReport(from, m?.[1]?.trim() || null) });
@@ -2861,6 +2987,8 @@ async function startBot() {
               "Upload file bernama KP Daily - menjadi sumber NTB/ETB (hanya Area Bangkalan)\n" +
               "/grafik - buat grafik payment per point\n" +
               "/grafik tunggakan - grafik tunggakan per point\n" +
+              "/wob - daftar WOB 6 / DPD 7+ seluruh Area Bangkalan\n" +
+              "/wob point XXX - daftar WOB 6 / DPD 7+ per Point\n" +
               "/statusclosing - status report closing hari ini\n" +
               "/rekapclosing - rekap closing area hari ini\n" +
               "/rekapclosing YYYY-MM-DD - rekap tanggal tertentu\n" +
