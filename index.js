@@ -995,6 +995,56 @@ function formatReportStatus(date) {
   );
 }
 
+
+function parsePqiPointFromQuestion(text) {
+  const m = String(text || "").match(/\b(?:pqi|repayment|paid)[\s,:-]+(?:point\s+)?([A-Za-zÀ-ÿ0-9 .'-]+?)(?=\s+(?:kurang|butuh|untuk|menuju|ke)\b|[?!.]|$)/i);
+  return m ? m[1].trim() : "";
+}
+
+function calculateAdditionalPaidForPqi(p) {
+  const tc = Number(p.totalCurrent || 0), pc = Number(p.paidCurrent || 0);
+  const t1 = Number(p.total1_30 || 0), p1 = Number(p.paid1_30 || 0);
+  const t31 = Number(p.total31_60 || 0), p31 = Number(p.paid31_60 || 0);
+  const totalA = tc;
+  const totalB = tc + t1 + t31;
+  if (totalA <= 0 || totalB <= 0) return null;
+
+  const target = 0.92;
+  const current = 0.5 * (pc / totalA) + 0.5 * ((pc+p1+p31) / totalB);
+  if (current >= target) return { current, needed: 0 };
+
+  // Each additional paid Current contributes to both numerators.
+  const a = 0.5 / totalA + 0.5 / totalB;
+  const needed = Math.max(0, Math.ceil((target-current) / a));
+  return { current, needed };
+}
+
+function answerPqiRepaymentQuestion(question, pqiRows) {
+  const q = String(question || "");
+  if (!/pqi/i.test(q) || !/(kurang|butuh|repayment|paid|mencapai|menuju).*(92|0[.,]92)|(?:92|0[.,]92).*(kurang|butuh|repayment|paid)/i.test(q)) return null;
+
+  const requestedPoint = parsePqiPointFromQuestion(q);
+  const rows = (pqiRows || []).filter(r => r && r.point);
+  const targets = requestedPoint
+    ? rows.filter(r => normalizeForSearch(r.point).includes(normalizeForSearch(requestedPoint)))
+    : rows;
+
+  if (!targets.length) return `🔎 Point ${requestedPoint || "yang diminta"} tidak ditemukan dalam data PQI Area Bangkalan.`;
+
+  const lines = ["🎯 KEBUTUHAN REPAYMENT MENUJU PQI 92%", ""];
+  for (const r of targets) {
+    const calc = calculateAdditionalPaidForPqi(r);
+    if (!calc) continue;
+    const pct = (calc.current * 100).toFixed(2).replace(".", ",");
+    if (calc.needed === 0) {
+      lines.push(`🟢 ${r.point}`, `PQI sekarang : ${pct}%`, `Status       : Aspiration`, `Kebutuhan    : 0 repayment`, "");
+    } else {
+      lines.push(`🔴 ${r.point}`, `PQI sekarang : ${pct}%`, `Target       : 92,00%`, `Kurang       : ${calc.needed} repayment`, "");
+    }
+  }
+  return lines.join("\n").trim();
+}
+
 async function processIncomingDailyReport(sock, from, sender, text) {
   const report = parseDailyReport(text);
   if (!report) return false;
