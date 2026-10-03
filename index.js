@@ -2828,21 +2828,16 @@ function buildPortfolioDashboardData() {
   };
 }
 
-app.use("/dashboard", express.static(path.join(__dirname, "public")));
-app.get("/dashboard", (req, res) => res.sendFile(path.join(__dirname, "public", "dashboard.html")));
-app.get("/api/dashboard", (req, res) => {
-  if (!dashboardTokenOk(req)) return res.status(401).json({ error: "Dashboard token tidak valid." });
-  res.json(buildPortfolioDashboardData());
-});
-
 // ======================================================
 // KPI PORTFOLIO CONTROL TOWER API / DASHBOARD
 // ======================================================
 app.get("/api/dashboard", async (req, res) => {
+  if (!dashboardTokenOk(req)) return res.status(401).json({ error: "Dashboard token tidak valid." });
   try { res.json(await getKpiDashboardData()); }
   catch (err) { console.error("Dashboard API error:", err); res.status(500).json({ error: err.message }); }
 });
 
+app.use("/dashboard", express.static(path.join(__dirname, "public")));
 app.get("/dashboard", async (req, res) => {
   try {
     const html = await fs.readFile(path.join(__dirname, "public", "dashboard.html"), "utf8");
