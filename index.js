@@ -1364,14 +1364,196 @@ async function loadPublicGoogleSheet(url) {
   return loadSpreadsheetBuffer(buffer, `Google Sheets (${info.id})`);
 }
 
+
+// ======================================================
+// PERSISTENT KPI PORTFOLIO DATABASE V1
+// Sources: Current, DPD 1-30, DPD 31-60, DPD 61-90, KP Daily
+// Stored on Railway Volume /app/data/kpi
+// ======================================================
+const KPI_DATA_DIR = path.join(process.env.KPI_DATA_DIR || path.join(__dirname, "data"), "kpi");
+const KPI_FILES = {
+  current: path.join(KPI_DATA_DIR, "current.json"),
+  dpd1_30: path.join(KPI_DATA_DIR, "dpd_1_30.json"),
+  dpd31_60: path.join(KPI_DATA_DIR, "dpd_31_60.json"),
+  dpd61_90: path.join(KPI_DATA_DIR, "dpd_61_90.json"),
+  kpDaily: path.join(KPI_DATA_DIR, "kp_daily.json"),
+  history: path.join(KPI_DATA_DIR, "sync_history.json"),
+};
+let kpiSyncHistory = [];
+let kpiWriteQueue = Promise.resolve();
+
+async function initKpiDatabase() {
+  await fs.mkdir(KPI_DATA_DIR, { recursive: true });
+  try { kpiSyncHistory = JSON.parse(await fs.readFile(KPI_FILES.history, "utf8")); } catch { kpiSyncHistory = []; }
+}
+
+function saveKpiJson(file, data) {
+  const payload = JSON.stringify(data, null, 2);
+  kpiWriteQueue = kpiWriteQueue.catch(() => {}).then(() => fs.writeFile(file, payload, "utf8"));
+  return kpiWriteQueue;
+}
+
+async function readKpiJson(key) {
+  try { return JSON.parse(await fs.readFile(KPI_FILES[key], "utf8")); }
+  catch { return null; }
+}
+
+function classifyKpiSourceName(name) {
+  const s = String(name || "").toLowerCase().replace(/[–—]/g, "-");
+  if (/kp\s*daily|kp_daily|kpdaily/.test(s)) return "kpDaily";
+  if (/31\s*[-_]\s*60|dpd\s*31\s*[-_]\s*60/.test(s)) return "dpd31_60";
+  if (/61\s*[-_]\s*90|dpd\s*61\s*[-_]\s*90/.test(s)) return "dpd61_90";
+  if (/1\s*[-_]\s*30|dpd\s*1\s*[-_]\s*30|dpd[_\s-]*1[_\s-]*30/.test(s)) return "dpd1_30";
+  if (/\bcurrent\b|\bcurent\b|dpd\s*0|dpd[_\s-]*0/.test(s)) return "current";
+  return null;
+}
+
+function detectKpiRepaymentColumns(columns) {
+  return {
+    area: findColumn(columns, ["area_name", "area"]),
+    point: findColumn(columns, ["branch_name", "point", "point_name", "branch"]),
+    bp: findColumn(columns, ["agent_fullname", "bp_username", "bp_name", "agent_name", "bp"]),
+    customer: findColumn(columns, ["customer_name", "customer", "mitra_name"]),
+    customerNumber: findColumn(columns, ["customer_number", "customer_no", "customer_number_id"]),
+    loanId: findColumn(columns, ["loan_id", "loanid", "id_loan"]),
+    dpdOld: findColumn(columns, ["dpd_old"]),
+    dpdNew: findColumn(columns, ["dpd_new"]),
+    osNew: findColumn(columns, ["os_new"]),
+    payment: findColumn(columns, ["total_payment", "payment"]),
+    paymentMin1x: findColumn(columns, ["payment_min_1x", "total_payment_min_1x"]),
+    arrears: findColumn(columns, ["total_tunggakan", "arrears", "tunggakan"]),
+    restructured: findColumn(columns, ["is_loan_restructured"]),
+  };
+}
+
+function kpiRowsForBucket(session, bucket) {
+  const sheet = session?.sheets?.slice().sort((a,b)=>b.rowCount-a.rowCount)[0];
+  if (!sheet) throw new Error("Sheet data tidak ditemukan.");
+  const d = detectKpiRepaymentColumns(sheet.columns || []);
+  if (!d.area || !d.point || !d.paymentMin1x) throw new Error("Kolom KPI wajib tidak lengkap. Dibutuhkan Area, Point, Payment Min 1x, dan struktur portfolio.");
+  if (bucket !== "kpDaily" && !d.dpdOld) throw new Error("Kolom DPD Old tidak ditemukan.");
+  const rows = sheet.rows.filter(r => normalizeArea(r[d.area]) === "bangkalan")
+    .filter(r => !d.restructured || isNo(r[d.restructured]));
+  return { sheet, columns: sheet.columns, detected: d, rows };
+}
+
+function kpiDailyPayload(session, sourceName) {
+  const sheet = session?.sheets?.slice().sort((a,b)=>b.rowCount-a.rowCount)[0];
+  if (!sheet) throw new Error("Sheet KP Daily tidak ditemukan.");
+  const d = detectKpDailyColumns(sheet.columns || []);
+  if (!d.area || !d.amount || !d.kind) throw new Error("KP Daily wajib memiliki Area, nominal approval, dan klasifikasi NTB/ETB.");
+  const rows = sheet.rows.filter(r => normalizeArea(r[d.area]) === "bangkalan");
+  return { version: 1, bucket: "kpDaily", sourceName, syncedAt: new Date().toISOString(), rowCount: rows.length, columns: sheet.columns, detected: d, rows };
+}
+
+function kpiRepaymentPayload(session, bucket, sourceName) {
+  const x = kpiRowsForBucket(session, bucket);
+  return { version: 1, bucket, sourceName, syncedAt: new Date().toISOString(), rowCount: x.rows.length, columns: x.columns, detected: x.detected, rows: x.rows };
+}
+
+async function syncKpiSpreadsheetUpload(sock, from, msg, filename, caption = "") {
+  const bucket = classifyKpiSourceName(filename) || classifyKpiSourceName(caption);
+  if (!bucket) return false;
+  try {
+    await sock.sendMessage(from, { text: `📥 Marley menyimpan sumber KPI *${filename}*...` });
+    const buffer = await downloadMediaMessage(msg, "buffer", {});
+    const session = await loadSpreadsheetBuffer(buffer, filename);
+    const payload = bucket === "kpDaily" ? kpiDailyPayload(session, filename) : kpiRepaymentPayload(session, bucket, filename);
+    await saveKpiJson(KPI_FILES[bucket], payload);
+    if (bucket === "kpDaily") {
+      for (const s of session.sheets) s.kpDetected = detectKpDailyColumns(s.columns);
+      kpDailySessions.set(from, session);
+    } else {
+      spreadsheetSessions.set(from, session);
+    }
+    kpiSyncHistory.push({ bucket, sourceName: filename, syncedAt: payload.syncedAt, rowCount: payload.rowCount });
+    kpiSyncHistory = kpiSyncHistory.slice(-500);
+    await saveKpiJson(KPI_FILES.history, kpiSyncHistory);
+    await sock.sendMessage(from, { text: `✅ *SUMBER KPI TERSIMPAN*\n\nJenis: ${bucket}\nArea: Bangkalan\nBaris: ${payload.rowCount.toLocaleString("id-ID")}\nUpdate: ${payload.syncedAt}\n\nDashboard Portfolio akan memakai data ini sebagai sumber KPI terbaru.` });
+    return true;
+  } catch (err) {
+    console.error("KPI persistent sync error:", err);
+    await sock.sendMessage(from, { text: `❌ Gagal menyimpan sumber KPI *${filename}*.\n${err.message}` });
+    return true;
+  }
+}
+
+function kpiRowSummary(payload) {
+  if (!payload) return null;
+  const d = payload.detected || {};
+  let total=0, paid=0, os=0, payment=0, arrears=0;
+  for (const r of payload.rows || []) {
+    const dpd = d.dpdOld ? toNumber(r[d.dpdOld]) : null;
+    if (payload.bucket === "current" && dpd !== null && dpd !== 0) continue;
+    if (payload.bucket === "dpd1_30" && dpd !== null && (dpd < 1 || dpd > 30)) continue;
+    if (payload.bucket === "dpd31_60" && dpd !== null && (dpd < 31 || dpd > 60)) continue;
+    if (payload.bucket === "dpd61_90" && dpd !== null && (dpd < 61 || dpd > 90)) continue;
+    total++;
+    if (d.paymentMin1x && isYes(r[d.paymentMin1x])) paid++;
+    if (d.osNew) os += toNumber(r[d.osNew]) || 0;
+    if (d.payment) payment += toNumber(r[d.payment]) || 0;
+    if (d.arrears) arrears += toNumber(r[d.arrears]) || 0;
+  }
+  return { total, paid, unpaid: total-paid, repayment: total ? paid/total : null, os, payment, arrears, sourceName: payload.sourceName, syncedAt: payload.syncedAt };
+}
+
+function kpiRowsForPoint(payloads, point) {
+  const out=[];
+  for (const p of payloads) if (p?.rows) {
+    const d=p.detected||{};
+    for (const r of p.rows) if (!point || String(r[d.point]??"").trim().toLowerCase()===String(point).trim().toLowerCase()) out.push({r,d,bucket:p.bucket});
+  }
+  return out;
+}
+
+function kpiBreakdown(payloads) {
+  const map=new Map();
+  for (const p of payloads) if (p?.rows) {
+    const d=p.detected||{};
+    for (const r of p.rows) {
+      const point=String(r[d.point]??"").trim(); const bp=String(r[d.bp]??"").trim();
+      if(!point) continue;
+      const key=point+"\u0000"+bp+"\u0000"+p.bucket;
+      if(!map.has(key)) map.set(key,{point,bp,bucket:p.bucket,total:0,paid:0,unpaid:0,os:0});
+      const x=map.get(key), dpd=d.dpdOld?toNumber(r[d.dpdOld]):null;
+      let include=true;
+      if(p.bucket==="current") include=dpd===0;
+      if(p.bucket==="dpd1_30") include=dpd!==null&&dpd>=1&&dpd<=30;
+      if(p.bucket==="dpd31_60") include=dpd!==null&&dpd>=31&&dpd<=60;
+      if(p.bucket==="dpd61_90") include=dpd!==null&&dpd>=61&&dpd<=90;
+      if(!include) continue;
+      x.total++; if(d.paymentMin1x&&isYes(r[d.paymentMin1x])) x.paid++; x.unpaid=x.total-x.paid; if(d.osNew)x.os+=toNumber(r[d.osNew])||0;
+    }
+  }
+  return [...map.values()].map(x=>({...x,repayment:x.total?x.paid/x.total:null})).sort((a,b)=>a.repayment===null?1:b.repayment===null?-1:a.repayment-b.repayment);
+}
+
+async function getKpiDashboardData() {
+  const current=await readKpiJson("current"), dpd1_30=await readKpiJson("dpd1_30"), dpd31_60=await readKpiJson("dpd31_60"), dpd61_90=await readKpiJson("dpd61_90"), kpDaily=await readKpiJson("kpDaily");
+  const buckets={current:kpiRowSummary(current), "1-30":kpiRowSummary(dpd1_30), "31-90":null};
+  const s31=kpiRowSummary(dpd31_60), s61=kpiRowSummary(dpd61_90);
+  const total31=(s31?.total||0)+(s61?.total||0), paid31=(s31?.paid||0)+(s61?.paid||0);
+  buckets["31-90"]=(s31||s61)?{total:total31,paid:paid31,unpaid:total31-paid31,repayment:total31?paid31/total31:null,os:(s31?.os||0)+(s61?.os||0),payment:(s31?.payment||0)+(s61?.payment||0),arrears:(s31?.arrears||0)+(s61?.arrears||0),sources:[s31?.sourceName,s61?.sourceName].filter(Boolean),syncedAt:[s31?.syncedAt,s61?.syncedAt].filter(Boolean).sort().pop()}:null;
+  const payloads=[current,dpd1_30,dpd31_60,dpd61_90].filter(Boolean);
+  const points=[...new Set(payloads.flatMap(p=>p.rows.map(r=>String(r[p.detected?.point]??"").trim()).filter(Boolean)))].sort();
+  const breakdown=kpiBreakdown(payloads);
+  let ntb=0,etb=0,ntbCount=0,etbCount=0,bps=new Set();
+  if(kpDaily?.rows){const d=kpDaily.detected||{};for(const r of kpDaily.rows){if(d.bp&&String(r[d.bp]??"").trim())bps.add(String(r[d.bp]).trim());const a=d.amount?toNumber(r[d.amount]):null;const k=classifyDisbursementKind(d.kind?r[d.kind]:"");if(d.status&&!isApprovalStatus(r[d.status]))continue;if(a===null||!k)continue;if(k==="NTB"){ntb+=a;ntbCount++;}else{etb+=a;etbCount++;}}}
+  const bpCount=bps.size, ntbTarget=bpCount*100000000, etbTarget=bpCount*175000000;
+  return {updatedAt:new Date().toISOString(),sources:{current:current?.sourceName||null,dpd1_30:dpd1_30?.sourceName||null,dpd31_60:dpd31_60?.sourceName||null,dpd61_90:dpd61_90?.sourceName||null,kpDaily:kpDaily?.sourceName||null},summary:{current:buckets.current,"1-30":buckets["1-30"],"31-90":buckets["31-90"],all:{loans:(buckets.current?.total||0)+(buckets["1-30"]?.total||0)+(buckets["31-90"]?.total||0),unpaid:(buckets.current?.unpaid||0)+(buckets["1-30"]?.unpaid||0)+(buckets["31-90"]?.unpaid||0),os:(buckets.current?.os||0)+(buckets["1-30"]?.os||0)+(buckets["31-90"]?.os||0)}},targets:{current:.98,"1-30":.55,"31-90":.13},points,breakdown,disbursement:{bpCount,ntb,ntbCount,ntbTarget,etb,etbCount,etbTarget},availability:{current:!!current,"1-30":!!dpd1_30,"31-60":!!dpd31_60,"61-90":!!dpd61_90,kpDaily:!!kpDaily}};
+}
+
 async function processSpreadsheetUpload(sock, from, msg, caption = "") {
   const document = msg.message?.documentMessage || msg.message?.documentWithCaptionMessage?.message?.documentMessage;
   if (!document) return false;
   const isGroup = from.endsWith("@g.us");
-  const allowedCaption = !isGroup || containsBotTrigger(caption) || /^\s*\/excel\b/i.test(caption);
-  if (!allowedCaption) return false;
   const filename = document.fileName || "spreadsheet";
   const mime = document.mimetype || "application/octet-stream";
+  if ((/\.(xlsx|xls|csv)$/i.test(filename) || /spreadsheet|excel|csv/i.test(mime)) && (classifyKpiSourceName(filename) || classifyKpiSourceName(caption))) {
+    return syncKpiSpreadsheetUpload(sock, from, msg, filename, caption);
+  }
+  const allowedCaption = !isGroup || containsBotTrigger(caption) || /^\s*\/excel\b/i.test(caption);
+  if (!allowedCaption) return false;
   if (!/\.(xlsx|xls|csv)$/i.test(filename) && !/spreadsheet|excel|csv/i.test(mime)) return false;
   if (isKpDailySourceName(filename) || /kp\s*daily/i.test(caption)) return processKpDailyUpload(sock, from, msg, caption);
   try {
@@ -2548,6 +2730,23 @@ app.get("/api/dashboard", (req, res) => {
 });
 
 // ======================================================
+// KPI PORTFOLIO CONTROL TOWER API / DASHBOARD
+// ======================================================
+app.get("/api/dashboard", async (req, res) => {
+  try { res.json(await getKpiDashboardData()); }
+  catch (err) { console.error("Dashboard API error:", err); res.status(500).json({ error: err.message }); }
+});
+
+app.get("/dashboard", async (req, res) => {
+  try {
+    const html = await fs.readFile(path.join(__dirname, "public", "dashboard.html"), "utf8");
+    res.type("html").send(html);
+  } catch (err) {
+    res.status(404).send("Dashboard belum tersedia. Pastikan public/dashboard.html sudah di-deploy.");
+  }
+});
+
+// ======================================================
 // WEB STATUS / QR
 // ======================================================
 
@@ -2594,6 +2793,7 @@ async function bootstrap() {
   await initMemory();
   await initDailyReports();
   await initPortfolioDatabase();
+  await initKpiDatabase();
   await startBot();
 }
 
