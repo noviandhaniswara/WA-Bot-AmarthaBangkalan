@@ -1404,7 +1404,7 @@ function classifyKpiSourceName(name) {
   if (/31\s*[-_]\s*60|dpd\s*31\s*[-_]\s*60/.test(s)) return "dpd31_60";
   if (/61\s*[-_]\s*90|dpd\s*61\s*[-_]\s*90/.test(s)) return "dpd61_90";
   if (/1\s*[-_]\s*30|dpd\s*1\s*[-_]\s*30|dpd[_\s-]*1[_\s-]*30/.test(s)) return "dpd1_30";
-  if (/\bcurrent\b|\bcurent\b|dpd\s*0|dpd[_\s-]*0/.test(s)) return "current";
+  if (/(?:^|[^a-z0-9])(?:current|curent)(?:[^a-z0-9]|$)|dpd\s*0|dpd[_\s-]*0/.test(s)) return "current";
   return null;
 }
 
@@ -1470,6 +1470,112 @@ async function syncKpiSpreadsheetUpload(sock, from, msg, filename, caption = "")
     kpiSyncHistory = kpiSyncHistory.slice(-500);
     await saveKpiJson(KPI_FILES.history, kpiSyncHistory);
     await sock.sendMessage(from, { text: `✅ *SUMBER KPI TERSIMPAN*\n\nJenis: ${bucket}\nArea: Bangkalan\nBaris: ${payload.rowCount.toLocaleString("id-ID")}\nUpdate: ${payload.syncedAt}\n\nDashboard Portfolio akan memakai data ini sebagai sumber KPI terbaru.` });
+
+    // Setelah sumber KPI tersimpan, gunakan kembali format analisa otomatis lama:
+    // per Point -> repayment vs target -> gap -> tambahan minimum payment -> total area.
+    if (bucket !== "kpDaily") {
+      const targetMap = { current: 0.98, dpd1_30: 0.55, dpd31_60: 0.13, dpd61_90: 0.13 };
+      const titleMap = {
+        current: "REPAYMENT CURRENT / DPD 0 PER POINT",
+        dpd1_30: "REPAYMENT DPD 1–30 PER POINT",
+        dpd31_60: "REPAYMENT DPD 31–60 PER POINT",
+        dpd61_90: "REPAYMENT DPD 61–90 PER POINT"
+      };
+      const target = targetMap[bucket];
+      const d = payload.detected || {};
+      if (!d.area) {
+        await sock.sendMessage(from, { text: "❌ Kolom area tidak ditemukan, jadi Marley tidak dapat memastikan filter Area Bangkalan." });
+      } else if (!d.point) {
+        await sock.sendMessage(from, { text: "❌ Kolom point tidak ditemukan." });
+      } else if (!d.dpdOld || !d.paymentMin1x) {
+        await sock.sendMessage(from, { text: "❌ Kolom DPD Old / Payment Min 1x tidak ditemukan." });
+      } else {
+        const bangkalanRows = (payload.rows || []).filter(r => normalizeArea(r[d.area]) === "bangkalan");
+        const points = uniqueValues({ ...payload, rows: bangkalanRows }, d.point);
+        const results = [];
+        for (const point of points) {
+          let total = 0, paid = 0;
+          for (const r of bangkalanRows) {
+            if (String(r[d.point] ?? "").trim() !== String(point).trim()) continue;
+            if (d.restructured && !isNo(r[d.restructured])) continue;
+            const dpd = toNumber(r[d.dpdOld]);
+            if (dpd === null) continue;
+            const inBucket = bucket === "current" ? dpd === 0
+              : bucket === "dpd1_30" ? dpd >= 1 && dpd <= 30
+              : bucket === "dpd31_60" ? dpd >= 31 && dpd <= 60
+              : dpd >= 61 && dpd <= 90;
+            if (!inBucket) continue;
+            total++;
+            if (isYes(r[d.paymentMin1x])) paid++;
+          }
+          if (!total) continue;
+          const repayment = paid / total;
+          const gap = Math.max(0, target - repayment);
+          const required = Math.max(0, Math.ceil(target * total) - paid);
+          results.push({ point, total, paid, unpaid: total - paid, repayment, gap, required });
+        }
+        results.sort((a,b) => a.repayment - b.repayment);
+        const area = { total: 0, paid: 0 };
+        for (const r of bangkalanRows) {
+          if (d.restructured && !isNo(r[d.restructured])) continue;
+          const dpd = toNumber(r[d.dpdOld]);
+          if (dpd === null) continue;
+          const inBucket = bucket === "current" ? dpd === 0
+            : bucket === "dpd1_30" ? dpd >= 1 && dpd <= 30
+            : bucket === "dpd31_60" ? dpd >= 31 && dpd <= 60
+            : dpd >= 61 && dpd <= 90;
+          if (!inBucket) continue;
+          area.total++;
+          if (isYes(r[d.paymentMin1x])) area.paid++;
+        }
+        if (!area.total) {
+          await sock.sendMessage(from, { text: `❌ Data ${titleMap[bucket]} tidak ditemukan untuk Area Bangkalan.` });
+        } else {
+          const lines = results.map((r,i) => {
+            const status = r.gap > 0
+              ? `⚠️ Kurang ${formatPct(r.gap)} | Tambahan min. ${formatCompactNumber(r.required)} payment`
+              : `✅ Tercapai | Lebih ${formatPct(r.repayment - target)}`;
+            return `${i+1}. *${r.point}* — ${formatCompactNumber(r.paid)}/${formatCompactNumber(r.total)} = *${formatPct(r.repayment)}* | ${status}`;
+          });
+          const areaRepayment = area.paid / area.total;
+          const areaGap = Math.max(0, target - areaRepayment);
+          const areaRequired = Math.max(0, Math.ceil(target * area.total) - area.paid);
+          const areaStatus = areaGap > 0
+            ? `⚠️ Kurang ${formatPct(areaGap)} | Tambahan min. ${formatCompactNumber(areaRequired)} payment`
+            : `✅ Tercapai | Lebih ${formatPct(areaRepayment - target)}`;
+          await sock.sendMessage(from, { text:
+            `⚡ *${titleMap[bucket]}*\n` +
+            `Target KPI: *${formatPct(target)}*\n\n` +
+            `${lines.join("\n")}\n\n` +
+            `*TOTAL AREA*\n` +
+            `${formatCompactNumber(area.paid)}/${formatCompactNumber(area.total)} = *${formatPct(areaRepayment)}* | ${areaStatus}`
+          });
+        }
+      }
+    } else {
+      const d = payload.detected || {};
+      let ntb = 0, etb = 0, ntbCount = 0, etbCount = 0;
+      for (const r of payload.rows || []) {
+        if (d.status && !isApprovalStatus(r[d.status])) continue;
+        const amount = d.amount ? toNumber(r[d.amount]) : null;
+        const kind = classifyDisbursementKind(d.kind ? r[d.kind] : "");
+        if (amount == null || !kind) continue;
+        if (kind === "NTB") { ntb += amount; ntbCount++; }
+        else { etb += amount; etbCount++; }
+      }
+      const bpCount = d.bp ? new Set(payload.rows.map(r => String(r[d.bp] ?? "").trim()).filter(Boolean)).size : 0;
+      const ntbTarget = bpCount * 100000000;
+      const etbTarget = bpCount * 175000000;
+      await sock.sendMessage(from, { text:
+        `\n\n📊 *ANALISA KP DAILY OTOMATIS*\n` +
+        `Area: *Bangkalan*\n` +
+        `BP: *${formatCompactNumber(bpCount)}*\n\n` +
+        `NTB: *${formatMoney(ntb)}* | Target: *${formatMoney(ntbTarget)}*\n` +
+        `ETB: *${formatMoney(etb)}* | Target: *${formatMoney(etbTarget)}*\n\n` +
+        `Jumlah Approval NTB: *${formatCompactNumber(ntbCount)}*\n` +
+        `Jumlah Approval ETB: *${formatCompactNumber(etbCount)}*`
+      });
+    }
     return true;
   } catch (err) {
     console.error("KPI persistent sync error:", err);
