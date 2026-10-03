@@ -161,318 +161,6 @@ let loanMemory = {
   records: [],
 };
 
-const LOAN_MEMORY_HISTORY_FILE = path.join(DATA_DIR, "loan_memory_history.jsonl");
-const LOAN_MEMORY_SYNC_FILE = path.join(DATA_DIR, "loan_memory_sync.json");
-const BANGKALAN_AREA_CODES = new Set(
-  String(process.env.BANGKALAN_AREA_CODES || "203")
-    .split(",")
-    .map((x) => x.trim().toLowerCase())
-    .filter(Boolean)
-);
-
-let loanMemorySync = {
-  version: 1,
-  last_sync_at: null,
-  last_sync_date: null,
-  last_source: null,
-  last_stats: null,
-};
-
-async function initLoanMemorySync() {
-  try {
-    await fs.mkdir(DATA_DIR, { recursive: true });
-    try {
-      const raw = await fs.readFile(LOAN_MEMORY_SYNC_FILE, "utf8");
-      const parsed = JSON.parse(raw);
-      if (parsed && typeof parsed === "object") loanMemorySync = { ...loanMemorySync, ...parsed };
-    } catch {
-      await fs.writeFile(LOAN_MEMORY_SYNC_FILE, JSON.stringify(loanMemorySync, null, 2), "utf8");
-    }
-  } catch (err) {
-    console.error("Gagal menyiapkan metadata Loan Memory Sync:", err);
-  }
-}
-
-function saveLoanMemorySync() {
-  return fs.writeFile(LOAN_MEMORY_SYNC_FILE, JSON.stringify(loanMemorySync, null, 2), "utf8");
-}
-
-function jakartaDateString(date = new Date()) {
-  return new Intl.DateTimeFormat("en-CA", {
-    timeZone: "Asia/Jakarta",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  }).format(date);
-}
-
-function parseOpsReportDate(filename = "") {
-  const name = String(filename || "");
-  let m = name.match(/(20\d{2})[-_](\d{2})[-_](\d{2})/);
-  if (m) return `${m[1]}-${m[2]}-${m[3]}`;
-  m = name.match(/(\d{2})[-_](\d{2})[-_](20\d{2})/);
-  if (m) return `${m[3]}-${m[2]}-${m[1]}`;
-  return jakartaDateString();
-}
-
-function detectOpsReportColumns(columns = []) {
-  const normalized = columns.map((c) => normalizeHeader(c));
-  const by = (candidates) => {
-    for (const c of candidates) {
-      const idx = normalized.indexOf(normalizeHeader(c));
-      if (idx >= 0) return columns[idx];
-    }
-    return null;
-  };
-  return {
-    area: by(["area"]),
-    region: by(["region"]),
-    branch: by(["branch"]),
-    bp: by(["bp"]),
-    customerNumber: by(["customer_number", "customer number"]),
-    namaMitra: by(["nama_mitra", "nama mitra", "customer_name"]),
-    majelis: by(["majelis"]),
-    majelisId: by(["majelis_id", "majelis id"]),
-    loanId: by(["loan_id", "loan id"]),
-    loanType: by(["loan_type", "loan type"]),
-    disbursementDate: by(["disbursement_date", "disbursement date"]),
-    paymentStatus: by(["payment_status", "payment status"]),
-    dueDate: by(["tanggal_jatuh_tempo", "tanggal jatuh tempo"]),
-    arrears: by(["tunggakan"]),
-    weeklyRepayment: by(["weekly_repayment", "weekly repayment"]),
-    outstanding: by(["outstanding"]),
-    recovery: by(["pemulihan"]),
-    latestPayment: by(["latest_payment_date", "latest payment date"]),
-    excessPayment: by(["jumlah_bayar_lebih", "jumlah bayar lebih"]),
-    serviceDate: by(["tanggal_pelayanan", "tanggal pelayanan"]),
-    nextServiceDate: by(["tanggal_pelayanan_berikutnya", "tanggal pelayanan berikutnya"]),
-    homeVisitDate: by(["tanggal_home_visit", "tanggal home visit"]),
-    homeVisitStatus: by(["status_home_visit", "status home visit"]),
-    collectionSchedule: by(["jadwal_kumpulan", "jadwal kumpulan"]),
-    modalStatus: by(["status_modal", "status modal"]),
-  };
-}
-
-function isOpsReportSheet(sheet) {
-  if (!sheet?.columns?.length) return false;
-  const d = detectOpsReportColumns(sheet.columns);
-  return Boolean(d.customerNumber && d.namaMitra && d.majelis && d.loanId && d.paymentStatus && d.arrears && d.outstanding);
-}
-
-function isBangkalanOpsRow(row, d) {
-  const area = normalizeArea(row[d.area]);
-  if (area === "bangkalan") return true;
-  return BANGKALAN_AREA_CODES.has(area);
-}
-
-function normalizeDbKey(value) {
-  return String(value ?? "").trim();
-}
-
-function opsRecordFromRow(row, d, syncDate) {
-  const customerNumber = normalizeDbKey(row[d.customerNumber]);
-  return {
-    customer_number: customerNumber,
-    nama_mitra: row[d.namaMitra] ?? null,
-    majelis: row[d.majelis] ?? null,
-    majelis_id: row[d.majelisId] ?? null,
-    loan_id: row[d.loanId] ?? null,
-    loan_type: row[d.loanType] ?? null,
-    bp: row[d.bp] ?? null,
-    branch: row[d.branch] ?? null,
-    region: row[d.region] ?? null,
-    area: row[d.area] ?? null,
-    disbursement_date: row[d.disbursementDate] ?? null,
-    payment_status: row[d.paymentStatus] ?? null,
-    tanggal_jatuh_tempo: row[d.dueDate] ?? null,
-    tunggakan: row[d.arrears] ?? null,
-    weekly_repayment: row[d.weeklyRepayment] ?? null,
-    outstanding: row[d.outstanding] ?? null,
-    pemulihan: row[d.recovery] ?? null,
-    latest_payment_date: row[d.latestPayment] ?? null,
-    jumlah_bayar_lebih: row[d.excessPayment] ?? null,
-    tanggal_pelayanan: row[d.serviceDate] ?? null,
-    tanggal_pelayanan_berikutnya: row[d.nextServiceDate] ?? null,
-    tanggal_home_visit: row[d.homeVisitDate] ?? null,
-    status_home_visit: row[d.homeVisitStatus] ?? null,
-    jadwal_kumpulan: row[d.collectionSchedule] ?? null,
-    status_modal: row[d.modalStatus] ?? null,
-    presence_status: "ACTIVE",
-    last_seen_date: syncDate,
-    last_seen_at: new Date().toISOString(),
-    source: "Ops Report Penagihan",
-  };
-}
-
-function valuesDiffer(a, b) {
-  const keys = [
-    "nama_mitra","majelis","majelis_id","loan_id","loan_type","bp","branch","region","area",
-    "disbursement_date","payment_status","tanggal_jatuh_tempo","tunggakan","weekly_repayment","outstanding",
-    "pemulihan","latest_payment_date","jumlah_bayar_lebih","tanggal_pelayanan","tanggal_pelayanan_berikutnya",
-    "tanggal_home_visit","status_home_visit","jadwal_kumpulan","status_modal"
-  ];
-  return keys.some((k) => String(a?.[k] ?? "") !== String(b?.[k] ?? ""));
-}
-
-async function appendLoanMemoryHistory(syncDate, source, changedRecords, missingCustomerNumbers) {
-  if (!changedRecords.length && !missingCustomerNumbers.length) return;
-  const lines = [];
-  const now = new Date().toISOString();
-  for (const r of changedRecords) {
-    lines.push(JSON.stringify({
-      sync_date: syncDate,
-      synced_at: now,
-      type: "snapshot",
-      source,
-      customer_number: r.customer_number,
-      record: r,
-    }));
-  }
-  for (const customerNumber of missingCustomerNumbers) {
-    lines.push(JSON.stringify({
-      sync_date: syncDate,
-      synced_at: now,
-      type: "missing_from_latest_report",
-      source,
-      customer_number: customerNumber,
-    }));
-  }
-  if (lines.length) await fs.appendFile(LOAN_MEMORY_HISTORY_FILE, lines.join("\n") + "\n", "utf8");
-}
-
-async function syncOpsReportToLoanMemory(session, sourceName) {
-  const sheet = activeSheetFor(session);
-  if (!sheet || !isOpsReportSheet(sheet)) return null;
-
-  const d = detectOpsReportColumns(sheet.columns);
-  const syncDate = parseOpsReportDate(sourceName);
-  const incoming = new Map();
-  let skippedNonBangkalan = 0;
-
-  for (const row of sheet.rows || []) {
-    if (!isBangkalanOpsRow(row, d)) {
-      skippedNonBangkalan++;
-      continue;
-    }
-    const record = opsRecordFromRow(row, d, syncDate);
-    if (!record.customer_number) continue;
-    incoming.set(record.customer_number, record);
-  }
-
-  const before = new Map((loanMemory.records || []).map((r) => [normalizeDbKey(r.customer_number), r]));
-  const changedRecords = [];
-  const added = [];
-  const updated = [];
-
-  for (const [key, incomingRecord] of incoming.entries()) {
-    const old = before.get(key);
-    if (!old) {
-      const record = { ...incomingRecord, created_at: new Date().toISOString(), updated_at: new Date().toISOString() };
-      loanMemory.records.push(record);
-      added.push(record);
-      changedRecords.push(record);
-      continue;
-    }
-
-    const changed = valuesDiffer(old, incomingRecord) || old.presence_status !== "ACTIVE";
-    const merged = {
-      ...old,
-      ...incomingRecord,
-      presence_status: "ACTIVE",
-      last_seen_date: syncDate,
-      last_seen_at: new Date().toISOString(),
-      updated_at: changed ? new Date().toISOString() : (old.updated_at || old.last_seen_at || new Date().toISOString()),
-    };
-    Object.assign(old, merged);
-    if (changed) {
-      updated.push(old);
-      changedRecords.push(old);
-    }
-  }
-
-  const incomingKeys = new Set(incoming.keys());
-  const missing = [];
-  for (const record of loanMemory.records) {
-    const key = normalizeDbKey(record.customer_number);
-    if (!key || incomingKeys.has(key)) continue;
-    if (record.presence_status !== "MISSING_FROM_LATEST_REPORT") {
-      record.presence_status = "MISSING_FROM_LATEST_REPORT";
-      record.missing_since = syncDate;
-      record.updated_at = new Date().toISOString();
-      missing.push(key);
-    }
-  }
-
-  loanMemory.version = Math.max(2, Number(loanMemory.version) || 1);
-  loanMemory.updated_at = new Date().toISOString();
-  loanMemory.last_sync_date = syncDate;
-  loanMemory.last_source = sourceName;
-  loanMemory.area_scope = "Bangkalan";
-  loanMemory.primary_key = "customer_number";
-
-  await fs.mkdir(DATA_DIR, { recursive: true });
-  await fs.writeFile(LOAN_MEMORY_RUNTIME_FILE, JSON.stringify(loanMemory, null, 2), "utf8");
-  await appendLoanMemoryHistory(syncDate, sourceName, changedRecords, missing);
-
-  loanMemorySync = {
-    ...loanMemorySync,
-    last_sync_at: new Date().toISOString(),
-    last_sync_date: syncDate,
-    last_source: sourceName,
-    last_stats: {
-      incoming: incoming.size,
-      added: added.length,
-      updated: updated.length,
-      missing: missing.length,
-      total_database: loanMemory.records.length,
-      skipped_non_bangkalan: skippedNonBangkalan,
-    },
-  };
-  await saveLoanMemorySync();
-
-  return loanMemorySync.last_stats;
-}
-
-function formatLoanMemorySyncResult(sourceName, stats) {
-  return [
-    "🧠 *DAILY SYNC LOAN MEMORY*",
-    `Sumber: *${sourceName}*`,
-    `Area: *Bangkalan*`,
-    "",
-    `📥 Data CSV: *${formatCompactNumber(stats.incoming)}*`,
-    `➕ Data baru: *${formatCompactNumber(stats.added)}*`,
-    `🔄 Data diperbarui: *${formatCompactNumber(stats.updated)}*`,
-    `👀 Tidak muncul di file terbaru: *${formatCompactNumber(stats.missing)}*`,
-    `💾 Total database: *${formatCompactNumber(stats.total_database)}*`,
-    "",
-    "ℹ️ Data yang tidak muncul tidak langsung dianggap lunas. Marley menyimpannya sebagai *MISSING_FROM_LATEST_REPORT* sampai ada bukti status closed/lunas.",
-  ].join("\n");
-}
-
-async function processOpsReportUpload(sock, from, msg, caption = "") {
-  const document = msg.message?.documentMessage || msg.message?.documentWithCaptionMessage?.message?.documentMessage;
-  if (!document) return false;
-  const filename = document.fileName || "";
-  const mime = document.mimetype || "";
-  if (!/\.csv$/i.test(filename) && !/csv/i.test(mime)) return false;
-
-  try {
-    const buffer = await downloadMediaMessage(msg, "buffer", {});
-    const session = await loadSpreadsheetBuffer(buffer, filename || "Ops Report.csv");
-    const sheet = activeSheetFor(session);
-    if (!isOpsReportSheet(sheet)) return false;
-
-    await sock.sendMessage(from, { text: `🧠 Marley menerima *${filename}* sebagai *Ops Report Penagihan* dan sedang memperbarui database mitra...` });
-    const stats = await syncOpsReportToLoanMemory(session, filename);
-    await sock.sendMessage(from, { text: formatLoanMemorySyncResult(filename, stats) });
-    return true;
-  } catch (err) {
-    console.error("Ops Report Daily Sync error:", err);
-    await sock.sendMessage(from, { text: `❌ Marley gagal memperbarui database dari Ops Report.\n${err.message}` });
-    return true;
-  }
-}
-
 async function initLoanMemory() {
   try {
     await fs.mkdir(DATA_DIR, { recursive: true });
@@ -554,8 +242,6 @@ function formatLoanRecord(record) {
     `BP             : ${formatLoanValue(record.bp)}`,
     `Branch         : ${formatLoanValue(record.branch)}`,
     `Payment Status : ${formatLoanValue(record.payment_status)}`,
-    `DB Status      : ${formatLoanValue(record.presence_status)}`,
-    `Last Seen      : ${formatLoanValue(record.last_seen_date)}`,
     `Tunggakan      : Rp ${formatRupiah(record.tunggakan)}`,
     `Weekly Repay   : Rp ${formatRupiah(record.weekly_repayment)}`,
     `Outstanding    : Rp ${formatRupiah(record.outstanding)}`,
@@ -1429,6 +1115,195 @@ function formatWobReport(from, requestedPoint = null) {
   return lines.join("\n").trim();
 }
 
+
+// ======================================================
+// BREAKDOWN BP — CURRENT / DPD 1-30 / DPD 31-90
+// BP selalu diambil dari kolom agent_fullname.
+// Group utama = Point, lalu BP di dalam Point.
+// ======================================================
+
+function detectBreakdownBpColumns(sheet) {
+  const columns = sheet?.columns || [];
+  const normalized = columns.map(c => normalizeHeader(c));
+  const find = (names) => {
+    for (const name of names) {
+      const i = normalized.indexOf(normalizeHeader(name));
+      if (i >= 0) return columns[i];
+    }
+    return null;
+  };
+  return {
+    area: find(["area_name", "area"]),
+    point: find(["branch_name", "point", "point_name", "branch"]),
+    bp: find(["agent_fullname"]),
+    dpdOld: find(["dpd_old"]),
+    paymentMin1x: find(["payment_min_1x", "total_payment_min_1x"]),
+    restructured: find(["is_loan_restructured"]),
+  };
+}
+
+function breakdownBpBucketFromSheet(sheet, pointFilter, minDpd, maxDpd, target) {
+  const d = detectBreakdownBpColumns(sheet);
+  if (!d.area || !d.point || !d.bp || !d.dpdOld || !d.paymentMin1x) {
+    return { error: "Kolom wajib breakdown BP tidak lengkap. Marley membutuhkan area, point, agent_fullname, dpd_old, dan payment_min_1x." };
+  }
+  const grouped = new Map();
+  for (const row of sheet.rows || []) {
+    if (normalizeArea(row[d.area]) !== "bangkalan") continue;
+    if (d.restructured && !isNo(row[d.restructured])) continue;
+    const dpd = toNumber(row[d.dpdOld]);
+    if (dpd === null || dpd < minDpd || dpd > maxDpd) continue;
+    const point = String(row[d.point] ?? "").trim();
+    const bp = String(row[d.bp] ?? "").trim();
+    if (!point || !bp) continue;
+    if (pointFilter && normalizePqiText(point) !== normalizePqiText(pointFilter)) continue;
+    const key = `${point}||${bp}`;
+    let item = grouped.get(key);
+    if (!item) {
+      item = { point, bp, total: 0, paid: 0 };
+      grouped.set(key, item);
+    }
+    item.total++;
+    if (isYes(row[d.paymentMin1x])) item.paid++;
+  }
+  return {
+    items: [...grouped.values()].map(x => ({
+      ...x,
+      unpaid: x.total - x.paid,
+      repayment: x.total ? x.paid / x.total : null,
+      gap: Math.max(0, target - (x.total ? x.paid / x.total : 0)),
+      required: Math.max(0, Math.ceil(target * x.total) - x.paid),
+    }))
+  };
+}
+
+function breakdownBpBucketFromDpd3190(state, pointFilter, target) {
+  if (!state?.dpd31_60 || !state?.dpd61_90) {
+    return { error: "Data DPD 31–60 dan DPD 61–90 belum lengkap. Upload keduanya terlebih dahulu." };
+  }
+  const grouped = new Map();
+  for (const source of [state.dpd31_60, state.dpd61_90]) {
+    for (const sheet of source.sheets || []) {
+      const d = detectBreakdownBpColumns(sheet);
+      if (!d.area || !d.point || !d.bp || !d.dpdOld || !d.paymentMin1x) {
+        return { error: "Kolom wajib breakdown BP tidak lengkap pada file DPD 31–90. Marley membutuhkan area, point, agent_fullname, dpd_old, dan payment_min_1x." };
+      }
+      for (const row of sheet.rows || []) {
+        if (normalizeArea(row[d.area]) !== "bangkalan") continue;
+        if (d.restructured && !isNo(row[d.restructured])) continue;
+        const dpd = toNumber(row[d.dpdOld]);
+        if (dpd === null || dpd < 31 || dpd > 90) continue;
+        const point = String(row[d.point] ?? "").trim();
+        const bp = String(row[d.bp] ?? "").trim();
+        if (!point || !bp) continue;
+        if (pointFilter && normalizePqiText(point) !== normalizePqiText(pointFilter)) continue;
+        const key = `${point}||${bp}`;
+        let item = grouped.get(key);
+        if (!item) {
+          item = { point, bp, total: 0, paid: 0 };
+          grouped.set(key, item);
+        }
+        item.total++;
+        if (isYes(row[d.paymentMin1x])) item.paid++;
+      }
+    }
+  }
+  return {
+    items: [...grouped.values()].map(x => ({
+      ...x,
+      unpaid: x.total - x.paid,
+      repayment: x.total ? x.paid / x.total : null,
+      gap: Math.max(0, target - (x.total ? x.paid / x.total : 0)),
+      required: Math.max(0, Math.ceil(target * x.total) - x.paid),
+    }))
+  };
+}
+
+function parseBreakdownBpCommand(text) {
+  const raw = String(text || "").trim();
+  const m = raw.match(/^\/breakdown\s+bp(?:\s+(.+))?$/i);
+  if (!m) return null;
+  let rest = String(m[1] || "").trim();
+  let bucket = "current";
+  let point = null;
+  const bucketMatch = rest.match(/^(current|cur+ent|dpd\s*0|0|1\s*[-–_]\s*30|dpd\s*1\s*[-–_]\s*30|31\s*[-–_]\s*90|dpd\s*31\s*[-–_]\s*90)(?:\s+(.+))?$/i);
+  if (bucketMatch) {
+    const b = bucketMatch[1].toLowerCase().replace(/\s+/g, "");
+    if (/1[-–_]?30|dpd1[-–_]?30/.test(b)) bucket = "dpd1_30";
+    else if (/31[-–_]?90|dpd31[-–_]?90/.test(b)) bucket = "dpd31_90";
+    else bucket = "current";
+    point = bucketMatch[2]?.trim() || null;
+  } else if (rest) {
+    point = rest;
+  }
+  return { bucket, point };
+}
+
+function formatBreakdownBpReport(from, bucket = "current", requestedPoint = null) {
+  const autoState = autoKpiSessions.get(from) || {};
+  let result;
+  let target;
+  let label;
+
+  if (bucket === "current") {
+    const sheet = firstSheetFromSession(autoState.current);
+    if (!sheet) return "❌ Data Current belum tersedia. Upload file Current terlebih dahulu.";
+    target = KPI_CONFIG.dpd0.target;
+    label = "CURRENT / DPD 0";
+    result = breakdownBpBucketFromSheet(sheet, requestedPoint, 0, 0, target);
+  } else if (bucket === "dpd1_30") {
+    const sheet = firstSheetFromSession(autoState.dpd1_30);
+    if (!sheet) return "❌ Data DPD 1–30 belum tersedia. Upload file DPD 1–30 terlebih dahulu.";
+    target = KPI_CONFIG.dpd1_30.target;
+    label = "DPD 1–30";
+    result = breakdownBpBucketFromSheet(sheet, requestedPoint, 1, 30, target);
+  } else {
+    target = KPI_CONFIG.dpd31_90.target;
+    label = "DPD 31–90";
+    result = breakdownBpBucketFromDpd3190(dpd3190Sessions.get(from), requestedPoint, target);
+  }
+
+  if (result.error) return `❌ ${result.error}`;
+  if (!result.items?.length) {
+    return `ℹ️ Tidak ditemukan data *${label}* untuk${requestedPoint ? ` Point *${requestedPoint}*` : " Area Bangkalan"}.`;
+  }
+
+  const pointMap = new Map();
+  for (const item of result.items) {
+    if (!pointMap.has(item.point)) pointMap.set(item.point, []);
+    pointMap.get(item.point).push(item);
+  }
+  const points = [...pointMap.keys()].sort((a,b) => a.localeCompare(b, "id"));
+  const lines = [
+    `📊 *BREAKDOWN BP — ${label}*`,
+    `Target KPI: *${formatPct(target)}*`,
+    requestedPoint ? `Point: *${requestedPoint}*` : "Area: *Bangkalan*",
+    "",
+  ];
+
+  let areaTotal = 0, areaPaid = 0;
+  for (const point of points) {
+    lines.push(`*${point}*`);
+    const members = pointMap.get(point).sort((a,b) => a.bp.localeCompare(b.bp, "id"));
+    for (const x of members) {
+      areaTotal += x.total;
+      areaPaid += x.paid;
+      const status = x.repayment >= target
+        ? `🟢 tercapai | +${formatPct(x.repayment - target)}`
+        : `🔴 kurang ${formatPct(target - x.repayment)} | perlu +${formatCompactNumber(x.required)} payment`;
+      lines.push(`• *${x.bp}* — ${formatCompactNumber(x.paid)}/${formatCompactNumber(x.total)} = *${formatPct(x.repayment)}* | ${status}`);
+    }
+    lines.push("");
+  }
+
+  const areaRep = areaTotal ? areaPaid / areaTotal : 0;
+  const areaGap = Math.max(0, target - areaRep);
+  const areaRequired = Math.max(0, Math.ceil(target * areaTotal) - areaPaid);
+  lines.push("*TOTAL AREA/POINT TERPILIH*");
+  lines.push(`${formatCompactNumber(areaPaid)}/${formatCompactNumber(areaTotal)} = *${formatPct(areaRep)}* | ${areaRep >= target ? `🟢 tercapai | +${formatPct(areaRep-target)}` : `🔴 kurang ${formatPct(areaGap)} | perlu +${formatCompactNumber(areaRequired)} payment`}`);
+  return lines.join("\n").trim();
+}
+
 function normalizePqiText(v) {
   return String(v ?? "").toLowerCase().trim().replace(/[^\p{L}\p{N}]+/gu, "");
 }
@@ -2115,151 +1990,6 @@ function repaymentBucketForAuto(sheet, pointFilter, minDpd, maxDpd) {
     if (isYes(r[d.paymentMin1x])) paid++;
   }
   return { total, paid, unpaid: total - paid, repayment: total ? paid / total : null };
-}
-
-
-// ======================================================
-// BREAKDOWN BP — CURRENT / DPD 0
-// Command:
-//   /breakdown bp
-//   /breakdown bp kwanyar
-//
-// Sumber: Current terakhir yang sudah dimuat untuk chat.
-// Filter: Area Bangkalan + is_loan_restructured = NO.
-// Target KPI Current / DPD 0 = 98%.
-// Dikelompokkan: Point -> BP.
-// ======================================================
-
-function normalizeBreakdownText(value) {
-  return String(value ?? "")
-    .trim()
-    .toLowerCase()
-    .replace(/\s+/g, " ");
-}
-
-function detectBreakdownBpColumn(sheet) {
-  const d = sheet?.detected || {};
-  return d.bp || findColumn(sheet?.columns || [], [
-    "bp_username",
-    "agent_fullname",
-    "bp_name",
-    "agent_name",
-    "bp"
-  ]);
-}
-
-function formatBreakdownBpReport(from, requestedPoint = null) {
-  const autoState = autoKpiSessions.get(from) || {};
-  const currentSheet = firstSheetFromSession(autoState.current);
-
-  if (!currentSheet) {
-    return "❌ Data *Current* belum tersedia. Upload file Current terlebih dahulu.";
-  }
-
-  const d = currentSheet.detected || {};
-  if (!d.area || !d.point || !d.dpdOld || !d.paymentMin1x) {
-    return (
-      "❌ Struktur file Current belum lengkap untuk Breakdown BP.\n\n" +
-      "Marley membutuhkan: Area, Point, DPD Old, dan Payment Min 1x."
-    );
-  }
-
-  const bpColumn = detectBreakdownBpColumn(currentSheet);
-  if (!bpColumn) {
-    return (
-      "❌ Kolom BP belum ditemukan pada file Current.\n\n" +
-      "Marley membutuhkan salah satu kolom: *bp_username*, *agent_fullname*, atau *bp_name*."
-    );
-  }
-
-  const targetPoint = requestedPoint ? String(requestedPoint).trim() : null;
-  const targetPointKey = targetPoint ? normalizeBreakdownText(targetPoint) : null;
-  const grouped = new Map();
-  const pointNames = new Set();
-
-  for (const row of currentSheet.rows || []) {
-    if (normalizeArea(row[d.area]) !== "bangkalan") continue;
-    if (d.restructured && !isNo(row[d.restructured])) continue;
-
-    const point = String(row[d.point] ?? "").trim();
-    if (!point) continue;
-    pointNames.add(point);
-
-    if (targetPointKey && normalizeBreakdownText(point) !== targetPointKey) continue;
-
-    const dpd = toNumber(row[d.dpdOld]);
-    if (dpd !== 0) continue;
-
-    const bp = String(row[bpColumn] ?? "").trim();
-    if (!bp) continue;
-
-    if (!grouped.has(point)) grouped.set(point, new Map());
-    const bpMap = grouped.get(point);
-    if (!bpMap.has(bp)) {
-      bpMap.set(bp, { total: 0, paid: 0 });
-    }
-
-    const item = bpMap.get(bp);
-    item.total += 1;
-    if (isYes(row[d.paymentMin1x])) item.paid += 1;
-  }
-
-  if (targetPoint && ![...pointNames].some((p) => normalizeBreakdownText(p) === targetPointKey)) {
-    const available = [...pointNames].sort((a, b) => a.localeCompare(b, "id"));
-    return (
-      `❌ Point *${targetPoint}* tidak ditemukan pada Current Area Bangkalan.\n\n` +
-      `Point tersedia: ${available.join(", ") || "-"}`
-    );
-  }
-
-  if (!grouped.size) {
-    return targetPoint
-      ? `❌ Tidak ada data Current DPD 0 untuk Breakdown BP di Point *${targetPoint}*.`
-      : "❌ Tidak ada data Current DPD 0 Area Bangkalan yang dapat di-breakdown per BP.";
-  }
-
-  const target = KPI_CONFIG.dpd0.target;
-  const points = [...grouped.keys()].sort((a, b) => a.localeCompare(b, "id"));
-  let areaTotal = 0;
-  let areaPaid = 0;
-  let areaRequired = 0;
-  let out = `📊 *BREAKDOWN BP — CURRENT / DPD 0*\nTarget: *${formatPct(target)}*\nArea: *Bangkalan*`;
-
-  for (const point of points) {
-    const bpEntries = [...grouped.get(point).entries()]
-      .map(([bp, v]) => {
-        const repayment = v.total ? v.paid / v.total : null;
-        const gap = Number.isFinite(repayment) ? Math.max(0, target - repayment) : null;
-        const required = Math.max(0, Math.ceil(target * v.total) - v.paid);
-        return { bp, ...v, repayment, gap, required };
-      })
-      .sort((a, b) => {
-        if ((a.repayment ?? 1) !== (b.repayment ?? 1)) return (a.repayment ?? 1) - (b.repayment ?? 1);
-        return a.bp.localeCompare(b.bp, "id");
-      });
-
-    out += `\n\n*${point.toUpperCase()}*`;
-    for (const x of bpEntries) {
-      const status = x.required > 0
-        ? `🔴 kurang ${formatPct(x.gap)} | perlu +${formatCompactNumber(x.required)} payment`
-        : `🟢 tercapai | +${formatPct(Math.max(0, x.repayment - target))}`;
-      out += `\n• *${x.bp}* — ${formatCompactNumber(x.paid)}/${formatCompactNumber(x.total)} = *${formatPct(x.repayment)}* | ${status}`;
-      areaTotal += x.total;
-      areaPaid += x.paid;
-    }
-  }
-
-  const areaRepayment = areaTotal ? areaPaid / areaTotal : null;
-  const areaGap = Number.isFinite(areaRepayment) ? Math.max(0, target - areaRepayment) : null;
-  areaRequired = Math.max(0, Math.ceil(target * areaTotal) - areaPaid);
-  const areaStatus = areaRequired > 0
-    ? `🔴 kurang ${formatPct(areaGap)} | perlu +${formatCompactNumber(areaRequired)} payment`
-    : `🟢 tercapai | +${formatPct(Math.max(0, areaRepayment - target))}`;
-
-  out += `\n\n*TOTAL ${targetPoint ? targetPoint.toUpperCase() : "AREA BANGKALAN"}*` +
-    `\n${formatCompactNumber(areaPaid)}/${formatCompactNumber(areaTotal)} = *${formatPct(areaRepayment)}* | ${areaStatus}`;
-
-  return out;
 }
 
 function formatAutoRepaymentReport(sheet, type) {
@@ -2951,19 +2681,8 @@ async function startBot() {
           batchMsg.message.documentWithCaptionMessage?.message?.documentMessage?.caption ||
           "";
         try {
-          const batchIsGroup = batchFrom.endsWith("@g.us");
-          if (batchIsGroup && !batchMsg.key.fromMe) {
-            const batchSenderJid = batchMsg.key.participant || batchFrom;
-            if (await isSpecialAutoReplySender(sock, batchFrom, batchSenderJid)) {
-              await sock.sendMessage(batchFrom, { text: SPECIAL_AUTO_REPLY_TEXT });
-            }
-          }
-          const handledOpsBatch = await processOpsReportUpload(sock, batchFrom, batchMsg, batchText);
-          if (handledOpsBatch) handledSpreadsheetInBatch = true;
-          else {
-            const handledBatchFile = await processSpreadsheetUpload(sock, batchFrom, batchMsg, batchText);
-            if (handledBatchFile) handledSpreadsheetInBatch = true;
-          }
+          const handledBatchFile = await processSpreadsheetUpload(sock, batchFrom, batchMsg, batchText);
+          if (handledBatchFile) handledSpreadsheetInBatch = true;
         } catch (batchSpreadsheetErr) {
           console.error("Spreadsheet batch engine error:", batchSpreadsheetErr);
         }
@@ -2997,10 +2716,8 @@ async function startBot() {
         msg.message.documentWithCaptionMessage?.message?.documentMessage?.caption ||
         "";
 
-      // Ops Report CSV -> Daily Sync Loan Memory otomatis.
+      // Spreadsheet / CSV / Google Sheets engine.
       try {
-        const handledOps = await processOpsReportUpload(sock, from, msg, text);
-        if (handledOps) return;
         const handledFile = await processSpreadsheetUpload(sock, from, msg, text);
         if (handledFile) return;
         const handledLink = await processSpreadsheetLink(sock, from, text);
@@ -3273,11 +2990,9 @@ async function startBot() {
         const command =
           text.trim().toLowerCase();
 
-        if (/^\/breakdown\s+bp(?:\s+(.+))?$/i.test(text.trim())) {
-          const m = text.trim().match(/^\/breakdown\s+bp(?:\s+(.+))?$/i);
-          await sock.sendMessage(from, {
-            text: formatBreakdownBpReport(from, m?.[1]?.trim() || null)
-          });
+        const breakdownBp = parseBreakdownBpCommand(text);
+        if (breakdownBp) {
+          await sock.sendMessage(from, { text: formatBreakdownBpReport(from, breakdownBp.bucket, breakdownBp.point) });
           return;
         }
 
@@ -3467,10 +3182,13 @@ async function startBot() {
               "Upload file bernama KP Daily - menjadi sumber NTB/ETB (hanya Area Bangkalan)\n" +
               "/grafik - buat grafik payment per point\n" +
               "/grafik tunggakan - grafik tunggakan per point\n" +
-              "/breakdown bp - breakdown Current per BP, dikelompokkan per Point\n" +
-              "/breakdown bp XXX - breakdown BP hanya untuk Point XXX\n" +
               "/wob - daftar WOB 6 / DPD 7+ seluruh Area Bangkalan\n" +
               "/wob point XXX - daftar WOB 6 / DPD 7+ per Point\n" +
+              "/breakdown bp - breakdown BP Current per Point\n" +
+              "/breakdown bp kwanyar - breakdown BP Current Point Kwanyar\n" +
+              "/breakdown bp 1-30 - breakdown BP DPD 1–30 per Point\n" +
+              "/breakdown bp 31-90 - breakdown BP DPD 31–90 per Point\n" +
+              "/breakdown bp 31-90 blega - breakdown BP DPD 31–90 Point Blega\n" +
               "/statusclosing - status report closing hari ini\n" +
               "/rekapclosing - rekap closing area hari ini\n" +
               "/rekapclosing YYYY-MM-DD - rekap tanggal tertentu\n" +
@@ -3624,7 +3342,6 @@ async function bootstrap() {
   await initMemory();
   await initDailyReports();
   await initLoanMemory();
-  await initLoanMemorySync();
   await startBot();
 }
 
