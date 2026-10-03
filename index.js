@@ -2117,6 +2117,151 @@ function repaymentBucketForAuto(sheet, pointFilter, minDpd, maxDpd) {
   return { total, paid, unpaid: total - paid, repayment: total ? paid / total : null };
 }
 
+
+// ======================================================
+// BREAKDOWN BP — CURRENT / DPD 0
+// Command:
+//   /breakdown bp
+//   /breakdown bp kwanyar
+//
+// Sumber: Current terakhir yang sudah dimuat untuk chat.
+// Filter: Area Bangkalan + is_loan_restructured = NO.
+// Target KPI Current / DPD 0 = 98%.
+// Dikelompokkan: Point -> BP.
+// ======================================================
+
+function normalizeBreakdownText(value) {
+  return String(value ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ");
+}
+
+function detectBreakdownBpColumn(sheet) {
+  const d = sheet?.detected || {};
+  return d.bp || findColumn(sheet?.columns || [], [
+    "bp_username",
+    "agent_fullname",
+    "bp_name",
+    "agent_name",
+    "bp"
+  ]);
+}
+
+function formatBreakdownBpReport(from, requestedPoint = null) {
+  const autoState = autoKpiSessions.get(from) || {};
+  const currentSheet = firstSheetFromSession(autoState.current);
+
+  if (!currentSheet) {
+    return "❌ Data *Current* belum tersedia. Upload file Current terlebih dahulu.";
+  }
+
+  const d = currentSheet.detected || {};
+  if (!d.area || !d.point || !d.dpdOld || !d.paymentMin1x) {
+    return (
+      "❌ Struktur file Current belum lengkap untuk Breakdown BP.\n\n" +
+      "Marley membutuhkan: Area, Point, DPD Old, dan Payment Min 1x."
+    );
+  }
+
+  const bpColumn = detectBreakdownBpColumn(currentSheet);
+  if (!bpColumn) {
+    return (
+      "❌ Kolom BP belum ditemukan pada file Current.\n\n" +
+      "Marley membutuhkan salah satu kolom: *bp_username*, *agent_fullname*, atau *bp_name*."
+    );
+  }
+
+  const targetPoint = requestedPoint ? String(requestedPoint).trim() : null;
+  const targetPointKey = targetPoint ? normalizeBreakdownText(targetPoint) : null;
+  const grouped = new Map();
+  const pointNames = new Set();
+
+  for (const row of currentSheet.rows || []) {
+    if (normalizeArea(row[d.area]) !== "bangkalan") continue;
+    if (d.restructured && !isNo(row[d.restructured])) continue;
+
+    const point = String(row[d.point] ?? "").trim();
+    if (!point) continue;
+    pointNames.add(point);
+
+    if (targetPointKey && normalizeBreakdownText(point) !== targetPointKey) continue;
+
+    const dpd = toNumber(row[d.dpdOld]);
+    if (dpd !== 0) continue;
+
+    const bp = String(row[bpColumn] ?? "").trim();
+    if (!bp) continue;
+
+    if (!grouped.has(point)) grouped.set(point, new Map());
+    const bpMap = grouped.get(point);
+    if (!bpMap.has(bp)) {
+      bpMap.set(bp, { total: 0, paid: 0 });
+    }
+
+    const item = bpMap.get(bp);
+    item.total += 1;
+    if (isYes(row[d.paymentMin1x])) item.paid += 1;
+  }
+
+  if (targetPoint && ![...pointNames].some((p) => normalizeBreakdownText(p) === targetPointKey)) {
+    const available = [...pointNames].sort((a, b) => a.localeCompare(b, "id"));
+    return (
+      `❌ Point *${targetPoint}* tidak ditemukan pada Current Area Bangkalan.\n\n` +
+      `Point tersedia: ${available.join(", ") || "-"}`
+    );
+  }
+
+  if (!grouped.size) {
+    return targetPoint
+      ? `❌ Tidak ada data Current DPD 0 untuk Breakdown BP di Point *${targetPoint}*.`
+      : "❌ Tidak ada data Current DPD 0 Area Bangkalan yang dapat di-breakdown per BP.";
+  }
+
+  const target = KPI_CONFIG.dpd0.target;
+  const points = [...grouped.keys()].sort((a, b) => a.localeCompare(b, "id"));
+  let areaTotal = 0;
+  let areaPaid = 0;
+  let areaRequired = 0;
+  let out = `📊 *BREAKDOWN BP — CURRENT / DPD 0*\nTarget: *${formatPct(target)}*\nArea: *Bangkalan*`;
+
+  for (const point of points) {
+    const bpEntries = [...grouped.get(point).entries()]
+      .map(([bp, v]) => {
+        const repayment = v.total ? v.paid / v.total : null;
+        const gap = Number.isFinite(repayment) ? Math.max(0, target - repayment) : null;
+        const required = Math.max(0, Math.ceil(target * v.total) - v.paid);
+        return { bp, ...v, repayment, gap, required };
+      })
+      .sort((a, b) => {
+        if ((a.repayment ?? 1) !== (b.repayment ?? 1)) return (a.repayment ?? 1) - (b.repayment ?? 1);
+        return a.bp.localeCompare(b.bp, "id");
+      });
+
+    out += `\n\n*${point.toUpperCase()}*`;
+    for (const x of bpEntries) {
+      const status = x.required > 0
+        ? `🔴 kurang ${formatPct(x.gap)} | perlu +${formatCompactNumber(x.required)} payment`
+        : `🟢 tercapai | +${formatPct(Math.max(0, x.repayment - target))}`;
+      out += `\n• *${x.bp}* — ${formatCompactNumber(x.paid)}/${formatCompactNumber(x.total)} = *${formatPct(x.repayment)}* | ${status}`;
+      areaTotal += x.total;
+      areaPaid += x.paid;
+    }
+  }
+
+  const areaRepayment = areaTotal ? areaPaid / areaTotal : null;
+  const areaGap = Number.isFinite(areaRepayment) ? Math.max(0, target - areaRepayment) : null;
+  areaRequired = Math.max(0, Math.ceil(target * areaTotal) - areaPaid);
+  const areaStatus = areaRequired > 0
+    ? `🔴 kurang ${formatPct(areaGap)} | perlu +${formatCompactNumber(areaRequired)} payment`
+    : `🟢 tercapai | +${formatPct(Math.max(0, areaRepayment - target))}`;
+
+  out += `\n\n*TOTAL ${targetPoint ? targetPoint.toUpperCase() : "AREA BANGKALAN"}*` +
+    `\n${formatCompactNumber(areaPaid)}/${formatCompactNumber(areaTotal)} = *${formatPct(areaRepayment)}* | ${areaStatus}`;
+
+  return out;
+}
+
 function formatAutoRepaymentReport(sheet, type) {
   const minDpd = type === "current" ? 0 : 1;
   const maxDpd = type === "current" ? 0 : 30;
@@ -3128,6 +3273,14 @@ async function startBot() {
         const command =
           text.trim().toLowerCase();
 
+        if (/^\/breakdown\s+bp(?:\s+(.+))?$/i.test(text.trim())) {
+          const m = text.trim().match(/^\/breakdown\s+bp(?:\s+(.+))?$/i);
+          await sock.sendMessage(from, {
+            text: formatBreakdownBpReport(from, m?.[1]?.trim() || null)
+          });
+          return;
+        }
+
         if (/^\/wob(?:\s+point\s+(.+))?$/i.test(text.trim())) {
           const m = text.trim().match(/^\/wob(?:\s+point\s+(.+))?$/i);
           await sock.sendMessage(from, {
@@ -3314,6 +3467,8 @@ async function startBot() {
               "Upload file bernama KP Daily - menjadi sumber NTB/ETB (hanya Area Bangkalan)\n" +
               "/grafik - buat grafik payment per point\n" +
               "/grafik tunggakan - grafik tunggakan per point\n" +
+              "/breakdown bp - breakdown Current per BP, dikelompokkan per Point\n" +
+              "/breakdown bp XXX - breakdown BP hanya untuk Point XXX\n" +
               "/wob - daftar WOB 6 / DPD 7+ seluruh Area Bangkalan\n" +
               "/wob point XXX - daftar WOB 6 / DPD 7+ per Point\n" +
               "/statusclosing - status report closing hari ini\n" +
