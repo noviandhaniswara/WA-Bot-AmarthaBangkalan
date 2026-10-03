@@ -36,3 +36,11 @@ Sumber database awal:
 2. Leads AM Jawa 2 2026-10-02 = data pelengkap
 Primary key = Customer Number
 Area scope = Bangkalan
+
+DPD 31-90 ENGINE
+- Upload file DPD 31-60 and file DPD 61-90.
+- Marley combines both as DPD 31-90.
+- Only Area Bangkalan is included.
+- is_loan_restructured must be NO; YES is excluded from numerator and denominator.
+- Target KPI DPD 31-90 = 13%.
+- Marley keeps the latest 31-60 and 61-90 file per chat/group and replaces the previous source when a new file arrives.

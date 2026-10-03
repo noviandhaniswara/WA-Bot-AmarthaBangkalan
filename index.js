@@ -1039,6 +1039,7 @@ async function processIncomingDailyReport(sock, from, sender, text) {
 // ======================================================
 
 const spreadsheetSessions = new Map();
+const dpd3190Sessions = new Map();
 const kpDailySessions = new Map();
 const SPREADSHEET_DIR = path.join(__dirname, "data", "spreadsheet_cache");
 
@@ -1317,6 +1318,97 @@ function detectAutoKpiFileType(filename, caption = "") {
   return null;
 }
 
+function detectDpd3190FileType(filename, caption = "") {
+  const s = `${String(filename || "")} ${String(caption || "")}`.toLowerCase();
+  if (/dpd[\s_-]*31[\s_-]*60|31[\s_-]*60/.test(s)) return "dpd31_60";
+  if (/dpd[\s_-]*61[\s_-]*90|61[\s_-]*90/.test(s)) return "dpd61_90";
+  return null;
+}
+
+function repaymentForDpd3190Sheets(sheets) {
+  let total = 0, paid = 0, paymentAmount = 0, os = 0, arrears = 0;
+  const movement = new Map();
+  const byPoint = new Map();
+  let missingArea = false;
+  for (const [bucket, sheet] of Object.entries(sheets || {})) {
+    if (!sheet) continue;
+    const d = sheet.detected || {};
+    if (!d.area || !d.dpdOld || !d.paymentMin1x) {
+      missingArea = true;
+      continue;
+    }
+    for (const r of sheet.rows || []) {
+      if (normalizeArea(r[d.area]) !== "bangkalan") continue;
+      if (d.restructured && !isNo(r[d.restructured])) continue;
+      const dpd = toNumber(r[d.dpdOld]);
+      if (dpd === null || dpd < 31 || dpd > 90) continue;
+      const point = d.point ? String(r[d.point] ?? "").trim() : "-";
+      const paidRow = isYes(r[d.paymentMin1x]);
+      total++;
+      if (paidRow) paid++;
+      if (d.payment) paymentAmount += toNumber(r[d.payment]) || 0;
+      if (d.osNew) os += toNumber(r[d.osNew]) || 0;
+      if (d.arrears) arrears += toNumber(r[d.arrears]) || 0;
+      const label = d.movement ? String(r[d.movement] ?? "").trim() : "";
+      if (label) movement.set(label, (movement.get(label) || 0) + 1);
+      const current = byPoint.get(point) || { total: 0, paid: 0 };
+      current.total++;
+      if (paidRow) current.paid++;
+      byPoint.set(point, current);
+    }
+  }
+  return {
+    total, paid, unpaid: total - paid, repayment: total ? paid / total : null,
+    paymentAmount, os, arrears, missingArea,
+    movement: [...movement.entries()].sort((a,b) => b[1]-a[1]),
+    byPoint: [...byPoint.entries()].map(([point,v]) => ({ point, ...v, repayment: v.total ? v.paid/v.total : null }))
+      .sort((a,b) => (a.repayment ?? 1) - (b.repayment ?? 1))
+  };
+}
+
+function formatDpd3190Report(state, includePoints = true) {
+  if (!state?.dpd31_60 || !state?.dpd61_90) {
+    const ready = [state?.dpd31_60 ? "31–60 ✓" : "31–60 ✗", state?.dpd61_90 ? "61–90 ✓" : "61–90 ✗"].join(" | ");
+    return `📊 *DPD 31–90*\n\nSumber: ${ready}\n\nMarley menunggu kedua file untuk menghitung DPD 31–90.`;
+  }
+  const r = repaymentForDpd3190Sheets(state);
+  if (!r.total) return "❌ Data DPD 31–90 Area Bangkalan tidak ditemukan setelah filter restruktur NO.";
+  const target = KPI_CONFIG.dpd31_90.target;
+  const gap = Math.max(0, target - r.repayment);
+  const required = Math.max(0, Math.ceil(target * r.total) - r.paid);
+  const status = r.repayment >= target ? `✅ Tercapai | Lebih ${formatPct(r.repayment-target)}` : `⚠️ Kurang ${formatPct(gap)} | Tambahan min. ${formatCompactNumber(required)} payment`;
+  let out = `🎯 *REPAYMENT DPD 31–90*\nTarget KPI: *${formatPct(target)}*\n\nTotal Loan : ${formatCompactNumber(r.total)}\nPayment ≥1x : ${formatCompactNumber(r.paid)}\nBelum Payment : ${formatCompactNumber(r.unpaid)}\nRepayment : *${formatPct(r.repayment)}*\nStatus : ${status}\nOS New : ${formatMoney(r.os)}`;
+  if (includePoints && r.byPoint.length) {
+    out += `\n\n*PER POINT*\n` + r.byPoint.map((x,i) => `${i+1}. *${x.point || "-"}* — ${formatCompactNumber(x.paid)}/${formatCompactNumber(x.total)} = *${formatPct(x.repayment)}*`).join("\n");
+  }
+  if (r.movement.length) out += `\n\n*MOVEMENT*\n` + r.movement.slice(0,10).map(([k,v]) => `• ${k}: ${formatCompactNumber(v)}`).join("\n");
+  return out;
+}
+
+function answerDpd3190Question(state, question) {
+  if (!state?.dpd31_60 || !state?.dpd61_90) return formatDpd3190Report(state, false);
+  const q = String(question || "").toLowerCase();
+  const r = repaymentForDpd3190Sheets(state);
+  if (!r.total) return "❌ Data DPD 31–90 Area Bangkalan tidak ditemukan setelah filter restruktur NO.";
+  if (/flow.*90|90\+|lebih.*90|to.*>90|to 90/.test(q)) {
+    const x = r.movement.filter(([k]) => />?\s*90|90\s*\+|to\s*90/i.test(k)).reduce((s, [,v]) => s+v, 0);
+    return `📌 *FLOW KE 90+*\n\nArea Bangkalan: *${formatCompactNumber(x)} loan*`;
+  }
+  if (/stay.*61|61.?90.*stay/.test(q)) {
+    const x = r.movement.filter(([k]) => /stay.*61.?90/i.test(k)).reduce((s, [,v]) => s+v, 0);
+    return `📌 *STAY 61–90*\n\nArea Bangkalan: *${formatCompactNumber(x)} loan*`;
+  }
+  if (/movement|pergerakan|flow|stay|rollback/.test(q)) {
+    return `🔄 *MOVEMENT DPD 31–90*\n\n${r.movement.map(([k,v]) => `• ${k}: ${formatCompactNumber(v)}`).join("\n")}`;
+  }
+  if (/point.*(tertinggi|terendah)|per point|ranking/.test(q)) {
+    return `📊 *DPD 31–90 PER POINT*\n\n${r.byPoint.map((x,i) => `${i+1}. *${x.point || "-"}* — ${formatCompactNumber(x.paid)}/${formatCompactNumber(x.total)} = *${formatPct(x.repayment)}*`).join("\n")}`;
+  }
+  if (/os|outstanding/.test(q)) return `💰 *OS DPD 31–90 Area Bangkalan*\n\n${formatMoney(r.os)}`;
+  if (/jumlah|berapa.*loan|berapa.*mitra|total/.test(q)) return `🔢 *TOTAL DPD 31–90*\n\nLoan: ${formatCompactNumber(r.total)}\nPayment ≥1x: ${formatCompactNumber(r.paid)}\nBelum Payment: ${formatCompactNumber(r.unpaid)}`;
+  return formatDpd3190Report(state, true);
+}
+
 function bangkalanRowsForAuto(sheet) {
   const d = sheet.detected || {};
   if (!d.area) return null;
@@ -1381,10 +1473,28 @@ async function processSpreadsheetUpload(sock, from, msg, caption = "") {
   const mime = document.mimetype || "application/octet-stream";
   if (!/\.(xlsx|xls|csv)$/i.test(filename) && !/spreadsheet|excel|csv/i.test(mime)) return false;
   const autoKpiType = detectAutoKpiFileType(filename, caption);
-  console.log(`[AUTO KPI] file=${filename} caption=${JSON.stringify(caption)} type=${autoKpiType || "NONE"}`);
-  const allowedCaption = !isGroup || autoKpiType || containsBotTrigger(caption) || /^\s*\/excel\b/i.test(caption);
+  const dpd3190Type = detectDpd3190FileType(filename, caption);
+  console.log(`[AUTO KPI] file=${filename} caption=${JSON.stringify(caption)} type=${autoKpiType || dpd3190Type || "NONE"}`);
+  const allowedCaption = !isGroup || autoKpiType || dpd3190Type || containsBotTrigger(caption) || /^\s*\/excel\b/i.test(caption);
   if (!allowedCaption) return false;
   if (isKpDailySourceName(filename) || /kp\s*daily/i.test(caption)) return processKpDailyUpload(sock, from, msg, caption);
+  if (dpd3190Type) {
+    try {
+      await sock.sendMessage(from, { text: `📊 Marley membaca *${filename}* sebagai sumber *DPD 31–90*...` });
+      const buffer = await downloadMediaMessage(msg, "buffer", {});
+      const session = await loadSpreadsheetBuffer(buffer, filename);
+      for (const sheet of session.sheets) sheet.detected = detectSpreadsheetColumns(sheet.columns);
+      const state = dpd3190Sessions.get(from) || {};
+      state[dpd3190Type] = session;
+      dpd3190Sessions.set(from, state);
+      const report = formatDpd3190Report(state, Boolean(state.dpd31_60 && state.dpd61_90));
+      await sock.sendMessage(from, { text: report });
+    } catch (err) {
+      console.error("DPD 31-90 upload error:", err);
+      await sock.sendMessage(from, { text: `❌ Marley gagal membaca file DPD 31–90.\n${err.message}` });
+    }
+    return true;
+  }
   try {
     await sock.sendMessage(from, { text: `📊 Marley sedang membaca *${filename}*...` });
     const buffer = await downloadMediaMessage(msg, "buffer", {});
@@ -1797,6 +1907,71 @@ function trackGroupActivity(groupId) {
 
 const BOT_NAME = "Marley";
 
+// ======================================================
+// AUTO REPLY NOMOR KHUSUS
+// ======================================================
+// Nomor disimpan dalam format internasional tanpa tanda +, spasi, atau strip.
+const SPECIAL_AUTO_REPLY_NUMBER = "6283854238002";
+const SPECIAL_AUTO_REPLY_TEXT =
+  "baik Siap komandan, akan Marley Monitor dan reminder ke teman teman BM";
+
+function normalizePhoneDigits(value) {
+  let digits = String(value || "").replace(/\D/g, "");
+  if (digits.startsWith("0")) digits = "62" + digits.slice(1);
+  if (digits.startsWith("+")) digits = digits.slice(1);
+  return digits;
+}
+
+function normalizeJid(value) {
+  return String(value || "")
+    .replace(/:[^@]+(?=@)/, "")
+    .trim();
+}
+
+function jidPhoneDigits(value) {
+  const jid = normalizeJid(value);
+  const user = jid.split("@")[0] || "";
+  return normalizePhoneDigits(user);
+}
+
+async function isSpecialAutoReplySender(sock, groupId, senderJid) {
+  const target = normalizePhoneDigits(SPECIAL_AUTO_REPLY_NUMBER);
+  if (!target || !senderJid) return false;
+
+  // Jika WhatsApp mengirim sender sebagai nomor JID, cocokkan langsung.
+  if (jidPhoneDigits(senderJid) === target) return true;
+
+  // Pada sebagian grup WhatsApp, sender bisa datang sebagai @lid.
+  // Metadata grup dipakai untuk mencari pasangan LID <-> nomor/JID.
+  if (!groupId?.endsWith("@g.us")) return false;
+
+  try {
+    const metadata = await sock.groupMetadata(groupId);
+    const participants = metadata?.participants || [];
+    const sender = normalizeJid(senderJid);
+
+    const participant = participants.find((p) => {
+      const ids = [p?.id, p?.jid, p?.lid, p?.phoneNumber, p?.phone].filter(Boolean);
+      return ids.some((id) => normalizeJid(id) === sender);
+    });
+
+    if (!participant) return false;
+
+    const candidateValues = [
+      participant?.id,
+      participant?.jid,
+      participant?.lid,
+      participant?.phoneNumber,
+      participant?.phone,
+    ];
+
+    return candidateValues.some((value) => jidPhoneDigits(value) === target);
+  } catch (err) {
+    console.warn("Gagal mencocokkan nomor auto-reply:", err?.message || err);
+    return false;
+  }
+}
+
 const triggerPattern = new RegExp(
   `(^|[\\s@.,!?;:()\\[\\]{}'"-])${BOT_NAME}(?=$|[\\s@.,!?;:()\\[\\]{}'"-])`,
   "i"
@@ -1966,6 +2141,28 @@ async function startBot() {
       // Pesan teks yang dikirim oleh akun bot sendiri tetap diabaikan agar tidak loop.
       // File spreadsheet sudah diproses di atas sebelum pengecekan fromMe.
       if (msg.key.fromMe) return;
+
+      // AUTO REPLY NOMOR KHUSUS: semua pesan dari nomor target di grup
+      // langsung dibalas dengan template khusus, tanpa melewati Gemini.
+      if (isGroup) {
+        const senderJid = msg.key.participant || msg.key.remoteJid;
+        const isSpecialSender =
+          await isSpecialAutoReplySender(sock, from, senderJid);
+
+        if (isSpecialSender) {
+          try {
+            await sock.sendMessage(from, {
+              text: SPECIAL_AUTO_REPLY_TEXT,
+            });
+          } catch (specialReplyErr) {
+            console.error(
+              "Gagal mengirim special auto-reply:",
+              specialReplyErr
+            );
+          }
+          return;
+        }
+      }
 
       const mentionedJids =
         msg.message.extendedTextMessage?.contextInfo
@@ -2358,6 +2555,7 @@ async function startBot() {
               "/data - status spreadsheet yang sedang dimuat\n" +
               "/loan <Customer Number/Nama Mitra> - cari data loan\n" +
               "/cari <Customer Number/Nama Mitra> - cari data loan\n" +
+              "Upload file DPD 31-60 + DPD 61-90 - menjadi sumber DPD 31-90 (hanya Area Bangkalan, restruktur NO)\n" +
               "Upload file bernama KP Daily - menjadi sumber NTB/ETB (hanya Area Bangkalan)\n" +
               "/grafik - buat grafik payment per point\n" +
               "/grafik tunggakan - grafik tunggakan per point\n" +
@@ -2378,6 +2576,12 @@ async function startBot() {
         ) {
           await answerLoanQuery(sock, from, stripMentions(text));
           return;
+        } else if (dpd3190Sessions.has(from) && (!isGroup || isMentioned) && /31\s*[-–_]?\s*90|dpd|repayment|movement|flow|stay|rollback|outstanding|os|point|ranking/i.test(stripMentions(text))) {
+          const cleanQ = stripMentions(text);
+          if (/31\s*[-–_]?\s*90|dpd\s*31|movement|flow|stay|rollback|outstanding|\bos\b|point|ranking/i.test(cleanQ)) {
+            await sock.sendMessage(from, { text: answerDpd3190Question(dpd3190Sessions.get(from), cleanQ) });
+            return;
+          }
         } else if ((spreadsheetSessions.has(from) || kpDailySessions.has(from)) && (!isGroup || isMentioned) && /kpi|repayment|ntb|etb|disbursement|spreadsheet|excel|point mana|ranking|tunggakan|data file|file ini|grafik|loan|payment|dpd/i.test(stripMentions(text))) {
           const cleanQ=stripMentions(text);
           if (/kpi|ntb|etb|disbursement/i.test(cleanQ) && kpDailySessions.has(from)) {
